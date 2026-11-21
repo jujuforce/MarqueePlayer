@@ -6,7 +6,7 @@ use std::rc::{Rc, Weak};
 
 use library::Track;
 use library::audio::{self, Column, FormatKey};
-use slint::{Image, Model, ModelNotify, ModelTracker};
+use slint::{Image, Model, ModelNotify, ModelRc, ModelTracker, VecModel};
 
 use crate::covers::{self, CoverListener, Kind};
 use crate::queue::Queue;
@@ -211,6 +211,47 @@ impl TrackModel {
     }
 }
 
+// A track without a disc number belongs to disc 1.
+fn starts_disc(tracks: &[Track], row: usize) -> bool {
+    row == 0 || tracks[row - 1].disc_no.unwrap_or(1) != tracks[row].disc_no.unwrap_or(1)
+}
+
+/// For each boundary between album rows, the number of disc headings above it.
+/// The last boundary gives the exact height even when no rows are on screen.
+pub fn album_heading_counts(tracks: &[Track], multi_disc: bool) -> ModelRc<i32> {
+    if !multi_disc {
+        return ModelRc::default();
+    }
+    let mut headings = 0;
+    let mut counts = Vec::with_capacity(tracks.len() + 1);
+    counts.push(0);
+    for i in 0..tracks.len() {
+        headings += i32::from(starts_disc(tracks, i));
+        counts.push(headings);
+    }
+    ModelRc::new(VecModel::from(counts))
+}
+
+/// Find the track containing the viewport's top, counting its disc heading as part of that row.
+pub fn first_track_at(counts: ModelRc<i32>, y: f32, row_height: f32, heading_height: f32) -> i32 {
+    if counts.row_count() == 0 {
+        return (y.max(0.) / row_height).floor() as i32;
+    }
+    let mut lo = 0;
+    let mut hi = counts.row_count() - 1;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let end =
+            (mid + 1) as f32 * row_height + counts.row_data(mid + 1).unwrap_or_default() as f32 * heading_height;
+        if end <= y {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo as i32
+}
+
 impl Model for TrackModel {
     type Data = TrackRow;
 
@@ -221,11 +262,7 @@ impl Model for TrackModel {
     fn row_data(&self, row: usize) -> Option<TrackRow> {
         let tracks = self.tracks.borrow();
         let t = tracks.get(row)?;
-        // A track without a disc number is on disc 1, as the album's order has it: "DISC 1"
-        // once, whether its tracks carry the number or not.
-        let disc_header = if self.disc_headers.get()
-            && (row == 0 || tracks[row - 1].disc_no.unwrap_or(1) != t.disc_no.unwrap_or(1))
-        {
+        let disc_header = if self.disc_headers.get() && starts_disc(&tracks, row) {
             format!("DISC {}", t.disc_no.unwrap_or(1))
         } else {
             String::new()
@@ -397,6 +434,33 @@ impl CoverListener for QueueModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn album_scroll_maps_disc_headings_and_track_boundaries() {
+        let tracks = [None, Some(1), Some(3), Some(3), Some(4)].map(|disc_no| Track { disc_no, ..Default::default() });
+        let counts = album_heading_counts(&tracks, true);
+        assert_eq!(counts.iter().collect::<Vec<_>>(), [0, 1, 1, 2, 2, 3]);
+        let row = |y| first_track_at(counts.clone(), y, 52., 44.);
+        for (index, top, end) in [(0, 0., 96.), (1, 96., 148.), (2, 148., 244.), (3, 244., 296.), (4, 296., 392.)] {
+            assert_eq!(row(top), index);
+            assert_eq!(row(end - 0.5), index);
+            assert_eq!(row(end), index + 1);
+        }
+        assert_eq!(row(-120.), 0); // The album cover is still in view.
+        assert_eq!(row(450.), 5); // In the page padding after the last track.
+    }
+
+    #[test]
+    fn single_disc_album_scroll_uses_plain_track_heights() {
+        let tracks = [Track::default(), Track::default()];
+        let counts = album_heading_counts(&tracks, false);
+        assert_eq!(counts.row_count(), 0);
+        let row = |y| first_track_at(counts.clone(), y, 52., 44.);
+        assert_eq!(row(-120.), 0);
+        assert_eq!(row(51.5), 0);
+        assert_eq!(row(52.), 1);
+        assert_eq!(row(104.), 2);
+    }
 
     #[test]
     fn queue_highlight_moves_without_resetting_rows() {

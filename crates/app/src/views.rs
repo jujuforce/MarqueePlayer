@@ -1205,10 +1205,11 @@ fn fill_album(st: &Rc<State>, id: i64) -> bool {
     // The album's format in one line; its rows show theirs only where they differ.
     let summary = library::audio::album_summary(&tracks.iter().map(|t| (t.audio, t.duration)).collect::<Vec<_>>());
     st.lists.album.set_details_column(summary.column);
+    let page = app.global::<AlbumPage>();
+    page.set_heading_counts(crate::rows::album_heading_counts(&tracks, discs.len() > 1));
     st.lists.album.set(tracks, favs, discs.len() > 1);
     st.lists.album.set_playing(playing_track_id(st));
 
-    let page = app.global::<AlbumPage>();
     page.set_album(covers::card(&album, None));
     page.set_info(info.join("  ·  ").into());
     page.set_details(summary.line.into());
