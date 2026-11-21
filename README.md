@@ -1,7 +1,7 @@
 # Marquee Player
 
 **A music player that puts your album art first.** It plays the music in your own folders and
-on your Navidrome server as one library, for Windows, Linux and macOS.
+on a Plex or Subsonic server as one library, for Windows, Linux and macOS.
 
 [**Download the latest release**](https://github.com/OffbeatDX/MarqueePlayer/releases/latest) ·
 [Documentation](docs/README.md) · [Android app](android/README.md)
@@ -16,8 +16,10 @@ on your Navidrome server as one library, for Windows, Linux and macOS.
 
 - **Your library, as it is.** Point it at your folders and play within seconds while the rest is
   scanned. Moved and renamed files keep their plays, favourites and playlist places.
-- **Navidrome built in.** Any Subsonic / OpenSubsonic server sits beside your local files, with
-  streaming, caching and favourites and plays synced back.
+- **Music from your server.** Sign in to Plex in your browser and choose a music library on
+  your server, or connect a Navidrome or Subsonic server. Browse its albums alongside your folders
+  and stream at original quality or a lower MP3 bitrate. Marquee caches tracks for replay. Subsonic servers can also sync
+  favourites and play history.
 - **Sound left alone.** Gapless playback, ReplayGain, crossfade that keeps albums gapless, and
   bit-perfect output (WASAPI exclusive on Windows, native rates on PipeWire).
 - **A real equalizer.** Up to 32 bands, a setting per device, and import from Equalizer APO,
@@ -44,7 +46,7 @@ Get the package for your system from the
 | Linux | `.AppImage` (`chmod +x`, then run it) |
 | macOS (Apple Silicon) | `.dmg`; the app is not notarised, so the first launch needs [one extra step](docs/macos.md#first-launch) |
 
-On first start, add a music folder or connect a Navidrome server. Your music files are only
+On first start, add a music folder or connect a music server. Your music files are only
 ever read, unless you turn on tag editing.
 
 > The macOS version is new and has had far less testing than Windows and Linux:

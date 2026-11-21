@@ -2,17 +2,12 @@
 //! UI thread; `server/mod.rs` decides when, and words what happened.
 //!
 //! **A sync** (`run`, on a thread of its own with its own database connection):
-//! 1. `getScanStatus`. Unless asked to list anyway (`Job::force`: sign-in, Sync now, a removal
-//!    confirmed), a server that has not scanned since the last sync that saw its whole catalog
-//!    is not listed again: nothing on it can have changed (`UpToDate`). With favourites
-//!    synced, its stars are read then (`getStarred2`, one request): a star changed on
-//!    the server needs no scan of its own.
-//! 2. The albums, `getAlbumList2` by name, 500 a page (the most Navidrome gives), until a page
-//!    comes back short (or brings no album not listed already, or `MAX_PAGES`: then the listing
-//!    is not complete); then each album with its songs (`getAlbum`), three at a time: gentle on a
-//!    home server, three times faster than one by one. (`search3` with an empty query would list
-//!    songs faster, but whether every server answers it with everything is not known; the album
-//!    route is the one the Subsonic API documents for every server.)
+//! 1. On Plex, read the music sections and their revisions. On Subsonic, ask for
+//!    `getScanStatus`. A complete Subsonic catalog at the same scan revision can be skipped
+//!    unless `Job::force` is set. A skipped listing can still read favourites (`getStarred2`).
+//! 2. List albums in each Plex music section, or use Subsonic `getAlbumList2` by name.
+//!    Read up to 500 per page. A repeated page or reaching `MAX_PAGES` marks the listing
+//!    incomplete. Read tracks for three albums at a time using Plex children or `getAlbum`.
 //! 3. Every `CHUNK` albums read, they are written (`remote::sync` of what was read, not
 //!    `complete`): the first albums are in the library within seconds of signing in, and the
 //!    open page takes them in as it does a scan's batches. At the end, the whole catalog once
@@ -25,9 +20,10 @@
 //! the user spelt otherwise, another user): the library's catalog is kept under the identity it
 //! was synced with. Once the albums are listed (before anything is written), their ids are
 //! compared with the catalog's (`same_server`): the same server's catalog is kept, under the new
-//! name (another user's agreements on favourites forgotten: `remote::rename`); another server's
-//! stays as it is, nothing written, until the user confirms its replacement in Settings (the
-//! shrink guard's confirmation: `Outcome::OtherServer`, then `Job::confirm_removal`).
+//! name (another user's agreements on favourites forgotten: `remote::rename`). Plex machine
+//! identifiers establish identity directly. A different server's catalog stays in the library
+//! until the user confirms its replacement in Settings (`Outcome::OtherServer`, then
+//! `Job::confirm_removal`).
 //!
 //! Writes wait for a running scan, and a scan for a sync's write (`WRITER`): each writes in short
 //! transactions that let the app's own writes in (`db::let_waiting_in`), but two background
@@ -36,7 +32,7 @@
 //!
 //! **Covers** (`covers_*`, one thread for the app's lifetime, idle on a condition variable): an
 //! album only the server has (its folder is no folder) has no art of its own; its cover is
-//! fetched (`getCoverArt` at `art::FULL_PX`) into the art cache, which makes the same sizes,
+//! fetched at `art::FULL_PX` into the art cache, which makes the same sizes,
 //! backdrop and accent as for a local cover. Newest albums first, three at a time; an album on
 //! screen without one first of all (`covers_want`). An album with a file of its own keeps the
 //! art the scan found for it. What was fetched is recorded in `albums.art_checked` as
@@ -52,16 +48,17 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, TryLockError};
 use std::time::Duration;
 
 use library::ArtCache;
-use library::remote::{self, Catalog, RemoteAlbum, RemoteArtist, RemoteSong, SyncOptions, SyncReport};
-use subsonic::{AlbumList, Client, Error};
+use library::remote::{self, Catalog, RemoteAlbum, SyncOptions, SyncReport};
+use subsonic::Error;
 
+use super::provider::{Client, ListedAlbum, is_plex_identity};
 use crate::server::write::View;
 
-/// Albums per `getAlbumList2` page (Navidrome's most).
+/// Albums per page (Navidrome's maximum).
 const PAGE: u32 = 500;
 /// Pages listed at most (a million albums): a server that pages wrongly is not listed forever.
 const MAX_PAGES: usize = 2000;
-/// Albums read at once (`getAlbum`).
+/// Albums whose tracks are read concurrently.
 const READERS: usize = 3;
 /// Albums read, then written, at a time while listing.
 const CHUNK: usize = 60;
@@ -99,6 +96,7 @@ pub enum Step {
     /// The server's catalog of another server or user is being removed.
     Replacing,
     Asking,
+    PlexLibraries(Vec<super::plex::MusicLibrary>),
     /// Album list pages read: this many albums so far.
     Listing { albums: usize },
     /// Albums read with their songs, of all listed.
@@ -114,6 +112,8 @@ pub enum Step {
 
 #[derive(Debug)]
 pub enum Outcome {
+    /// No saved selection, or the selected section is no longer offered. No catalog writes.
+    ChoosePlexLibrary(Vec<super::plex::MusicLibrary>),
     /// The server has not scanned since the last complete sync: nothing listed. What it says of
     /// its stars now (empty when not asked).
     UpToDate(View),
@@ -159,34 +159,27 @@ fn wait_writer(cancel: &AtomicBool, tell: &(dyn Fn(Step) + Sync)) -> Option<Mute
     }
 }
 
-/// Each album of `ids` with its songs, `READERS` at a time, in order; None for those not read
+/// Each listed album with its songs, `READERS` at a time, in order; None for those not read
 /// because the sync was stopped.
-fn read_albums(client: &Client, ids: &[&str], cancel: &AtomicBool) -> Vec<Option<Result<subsonic::Album, Error>>> {
+fn read_albums(client: &Client, listed: &[&ListedAlbum], cancel: &AtomicBool) -> Vec<Option<Result<RemoteAlbum, Error>>> {
     let next = AtomicUsize::new(0);
-    let out: Mutex<Vec<Option<Result<subsonic::Album, Error>>>> = Mutex::new((0..ids.len()).map(|_| None).collect());
+    let out: Mutex<Vec<Option<Result<RemoteAlbum, Error>>>> = Mutex::new((0..listed.len()).map(|_| None).collect());
     std::thread::scope(|s| {
-        for _ in 0..READERS.min(ids.len()) {
+        for _ in 0..READERS.min(listed.len()) {
             s.spawn(|| {
                 library::background_thread();
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
-                    if i >= ids.len() || cancel.load(Ordering::Relaxed) {
+                    if i >= listed.len() || cancel.load(Ordering::Relaxed) {
                         break;
                     }
-                    let r = client.album(ids[i]);
+                    let r = client.album(listed[i]);
                     out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
                 }
             });
         }
     });
     out.into_inner().unwrap_or_else(|e| e.into_inner())
-}
-
-/// An album that came with far fewer songs than the server counts for it (none, or under half):
-/// an answer cut short, not an album emptied. Taken as read, its songs would count as gone.
-fn cut_short(a: &subsonic::Album, listed: &subsonic::Album) -> bool {
-    let count = a.song_count.max(listed.song_count) as usize;
-    count > 0 && a.song.len() * 2 < count
 }
 
 fn db_error(e: impl std::fmt::Display) -> Outcome {
@@ -218,11 +211,24 @@ pub fn run(job: &Job, tell: &(dyn Fn(Step) + Sync)) -> Outcome {
     };
     let mut replaced = false;
     tell(Step::Asking);
-    let status = match job.client.scan_status() {
+    let initial = match &job.client {
+        Client::Plex(client) => match client.library_catalog() {
+            Ok(_) if cancel.load(Ordering::Relaxed) => return Outcome::Stopped,
+            Ok((choices, None)) => return Outcome::ChoosePlexLibrary(choices),
+            Ok((choices, Some(status))) => {
+                tell(Step::PlexLibraries(choices));
+                Ok(status)
+            }
+            Err(e) => Err(e),
+        },
+        Client::Subsonic(_) => job.client.catalog_state(),
+    };
+    let status = match initial {
         Ok(s) => s,
         Err(e) => return Outcome::Server(e),
     };
     if !job.force
+        && job.client.as_subsonic().is_some()
         && earlier.is_none()
         && let Ok(Some(s)) = remote::server(&conn)
         && s.synced_at.is_some()
@@ -241,40 +247,45 @@ pub fn run(job: &Job, tell: &(dyn Fn(Step) + Sync)) -> Outcome {
     // One album may be listed twice when the list moved under the pages: once is enough. A page
     // that brings no album not listed already ends the listing: a server that ignores `offset`
     // (each page its first) would otherwise be asked forever.
-    let mut listed: Vec<subsonic::Album> = Vec::new();
+    let mut listed = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut complete = !status.scanning;
-    let mut offset: u32 = 0;
-    for pages in 1.. {
-        if cancel.load(Ordering::Relaxed) {
-            return Outcome::Stopped;
-        }
-        match job.client.album_list2(&AlbumList::AlphabeticalByName, PAGE, offset, None) {
-            Ok(page) => {
-                let n = page.len();
-                offset = offset.saturating_add(n as u32);
-                let before = listed.len();
-                listed.extend(page.into_iter().filter(|a| seen.insert(a.id.clone())));
-                tell(Step::Listing { albums: listed.len() });
-                if n < PAGE as usize {
-                    break;
-                }
-                if listed.len() == before || pages >= MAX_PAGES {
-                    log::warn!("server sync: the album list pages no further (after {} albums); nothing is removed this time", listed.len());
+    for section in &status.sections {
+        let mut offset = 0;
+        for pages in 1.. {
+            if cancel.load(Ordering::Relaxed) {
+                return Outcome::Stopped;
+            }
+            let page = match job.client.albums(section.as_deref(), PAGE, offset) {
+                Ok(page) => page,
+                Err(e) if listed.is_empty() || is_sign_in(&e) => return Outcome::Server(e),
+                Err(e) => {
+                    log::warn!("server sync: the album list stopped after {} albums ({e})", listed.len());
                     complete = false;
                     break;
                 }
+            };
+            let n = page.len();
+            offset = offset.saturating_add(n as u32);
+            let before = listed.len();
+            listed.extend(page.into_iter().filter(|a| seen.insert(a.album.id.clone())));
+            // Overlapping Plex pages can hide an album that shifted between requests.
+            if listed.len() - before != n && matches!(&job.client, Client::Plex(_)) {
+                complete = false;
             }
-            Err(e) if listed.is_empty() || is_sign_in(&e) => return Outcome::Server(e),
-            Err(e) => {
-                log::warn!("server sync: the album list stopped after {} albums ({e})", listed.len());
+            tell(Step::Listing { albums: listed.len() });
+            if n < PAGE as usize {
+                break;
+            }
+            if listed.len() == before || pages >= MAX_PAGES {
+                log::warn!("server sync: the album list pages no further (after {} albums); nothing is removed this time", listed.len());
                 complete = false;
                 break;
             }
         }
     }
     if let Some(earlier) = &earlier {
-        let kin = match same_server(&job.client, &conn, &listed, cancel) {
+        let kin = match same_server(&job.client, earlier, &conn, &listed, cancel) {
             Ok(k) => k,
             Err(o) => return *o,
         };
@@ -312,26 +323,20 @@ pub fn run(job: &Job, tell: &(dyn Fn(Step) + Sync)) -> Outcome {
         if cancel.load(Ordering::Relaxed) {
             return Outcome::Stopped;
         }
-        let ids: Vec<&str> = chunk.iter().map(|a| a.id.as_str()).collect();
+        let batch: Vec<_> = chunk.iter().collect();
         let mut part: Vec<RemoteAlbum> = Vec::with_capacity(chunk.len());
         let mut last_error = None;
-        for (r, listed) in read_albums(&job.client, &ids, cancel).into_iter().zip(chunk) {
+        for r in read_albums(&job.client, &batch, cancel) {
             match r {
                 None => return Outcome::Stopped,
-                Some(Ok(a)) if cut_short(&a, listed) => {
-                    log::info!("server sync: an album came with {} of its {} songs; read as failed", a.song.len(), a.song_count.max(listed.song_count));
-                    failed += 1;
-                    complete = false;
-                }
-                Some(Ok(a)) => {
+                Some(Ok(mut album)) => {
                     // A song listed under two albums goes with the first (in the listing's
                     // order, the same at every sync), also across chunks written apart.
-                    let mut album = album_of(&a);
                     album.songs.retain(|s| claimed.insert(s.id.clone()));
                     part.push(album);
                 }
                 // Removed on the server since it was listed: rightly not in the catalog.
-                Some(Err(Error::NotFound(_))) => {}
+                Some(Err(Error::NotFound(_))) if job.client.as_subsonic().is_some() => {}
                 Some(Err(e)) if is_sign_in(&e) => return Outcome::Server(e),
                 Some(Err(e)) => {
                     failed += 1;
@@ -367,10 +372,10 @@ pub fn run(job: &Job, tell: &(dyn Fn(Step) + Sync)) -> Outcome {
         tell(Step::Written);
     }
     if complete {
-        match job.client.scan_status() {
-            Ok(now) if !now.scanning && now.last_scan == status.last_scan => {}
+        match job.client.catalog_state() {
+            Ok(now) if now == status => {}
             Ok(_) => {
-                log::info!("server sync: the server scanned while it was listed; nothing is removed this time");
+                log::info!("server sync: the catalog changed while it was listed; nothing is removed this time");
                 complete = false;
             }
             Err(e) => {
@@ -381,7 +386,7 @@ pub fn run(job: &Job, tell: &(dyn Fn(Step) + Sync)) -> Outcome {
     }
     tell(Step::Finishing);
     let Some(_w) = wait_writer(cancel, tell) else { return Outcome::Stopped };
-    let seen = crate::server::write::view_of(&catalog);
+    let seen = if job.client.as_subsonic().is_some() { crate::server::write::view_of(&catalog) } else { View::new() };
     let c = Catalog { albums: catalog, complete, server_scan: if complete { status.last_scan.clone() } else { None } };
     let mut report = match remote::sync(&mut conn, &job.identity, &c, &SyncOptions { confirm_removal: job.confirm_removal, ..opts }) {
         Ok(r) if r.interrupted => return Outcome::Stopped,
@@ -440,24 +445,29 @@ fn user_of(identity: &str) -> &str {
 /// ids changed with an upgrade, while its songs' did not) a few albums spread over the listing
 /// are read, and most of their songs known: the same. A sign-in refused, or the library not
 /// read, ends the sync (the `Err`).
-fn same_server(client: &Client, conn: &rusqlite::Connection, listed: &[subsonic::Album], cancel: &AtomicBool) -> Result<Kin, Box<Outcome>> {
+fn same_server(client: &Client, earlier: &str, conn: &rusqlite::Connection, listed: &[ListedAlbum], cancel: &AtomicBool) -> Result<Kin, Box<Outcome>> {
     let db = |e: rusqlite::Error| Box::new(db_error(e));
     let (albums, songs) = remote::kept(conn).map_err(db)?;
     let plays = library::marks::queued_count(conn).map_err(db)? as usize;
     if albums == 0 && songs == 0 && plays == 0 {
         return Ok(Kin::Nothing);
     }
-    let found = remote::kept_albums_among(conn, listed.iter().map(|a| a.id.as_str())).map_err(db)?;
+    // Plex identities are machine IDs. A changed identity involving Plex is always another
+    // catalog, even if both servers happen to number their albums and tracks identically.
+    if is_plex_identity(earlier) || matches!(client, Client::Plex(_)) {
+        return Ok(Kin::Other(Elsewhere { songs, plays }));
+    }
+    let found = remote::kept_albums_among(conn, listed.iter().map(|a| a.album.id.as_str())).map_err(db)?;
     if albums > 0 && found * 2 >= albums {
         return Ok(Kin::Same);
     }
     let step = listed.len().div_ceil(SAMPLE).max(1);
-    let sample: Vec<&str> = listed.iter().step_by(step).take(SAMPLE).map(|a| a.id.as_str()).collect();
+    let sample: Vec<_> = listed.iter().step_by(step).take(SAMPLE).collect();
     let mut read: Vec<String> = Vec::new();
     for r in read_albums(client, &sample, cancel) {
         match r {
             None => return Err(Box::new(Outcome::Stopped)),
-            Some(Ok(a)) => read.extend(a.song.into_iter().map(|s| s.id)),
+            Some(Ok(a)) => read.extend(a.songs.into_iter().map(|s| s.id)),
             Some(Err(e)) if is_sign_in(&e) => return Err(Box::new(Outcome::Server(e))),
             Some(Err(_)) => {}
         }
@@ -476,7 +486,8 @@ fn up_to_date_view(job: &Job, conn: &rusqlite::Connection) -> Result<View, Error
     if !job.marks {
         return Ok(View::new());
     }
-    match job.client.starred2(None) {
+    let Some(client) = job.client.as_subsonic() else { return Ok(View::new()) };
+    match client.starred2(None) {
         Ok(s) => {
             let kept: Vec<String> = conn.prepare("SELECT id FROM remote_songs").and_then(|mut st| st.query_map([], |r| r.get(0))?.collect()).unwrap_or_default();
             Ok(crate::server::write::view_of_starred(kept, &s.song))
@@ -492,153 +503,6 @@ fn up_to_date_view(job: &Job, conn: &rusqlite::Connection) -> Result<View, Error
 /// The sign-in no longer works: the user must sign in again.
 pub fn is_sign_in(e: &Error) -> bool {
     matches!(e, Error::WrongCredentials { .. })
-}
-
-// ---- the client's model onto the library's ----------------------------------------------
-
-fn opt(s: &str) -> Option<String> {
-    let s = s.trim();
-    (!s.is_empty()).then(|| s.to_owned())
-}
-
-fn date(d: &Option<subsonic::ItemDate>) -> Option<String> {
-    let d = d.as_ref()?;
-    let y = d.year.filter(|y| *y > 0)?;
-    Some(match (d.month.filter(|m| (1..=12).contains(m)), d.day.filter(|d| (1..=31).contains(d))) {
-        (Some(m), Some(day)) => format!("{y:04}-{m:02}-{day:02}"),
-        (Some(m), None) => format!("{y:04}-{m:02}"),
-        _ => format!("{y:04}"),
-    })
-}
-
-/// Unix milliseconds of an ISO 8601 UTC time as servers send them ("2024-05-01T10:00:00Z",
-/// with or without fractions, "+00:00" or an offset).
-pub fn iso_ms(s: &str) -> Option<i64> {
-    let s = s.trim();
-    let (d, rest) = s.split_once(['T', ' ']).unwrap_or((s, "00:00:00Z"));
-    let mut dp = d.split('-');
-    let (y, mo, da): (i64, i64, i64) = (dp.next()?.parse().ok()?, dp.next()?.parse().ok()?, dp.next()?.parse().ok()?);
-    if !(1..=12).contains(&mo) || !(1..=31).contains(&da) || y > 9999 {
-        return None;
-    }
-    let (time, offset_s) = match rest.find(['Z', 'z', '+', '-']) {
-        Some(i) => {
-            let (t, z) = rest.split_at(i);
-            let off = match z.chars().next() {
-                Some('+' | '-') => {
-                    let sign = if z.starts_with('-') { -1 } else { 1 };
-                    let hm: Vec<i64> = z[1..].split(':').filter_map(|p| p.parse().ok()).collect();
-                    if hm.iter().any(|v| !(0..10_000).contains(v)) {
-                        return None;
-                    }
-                    match hm.as_slice() {
-                        [h, m] => sign * (h * 3600 + m * 60),
-                        [hm] if *hm >= 100 => sign * ((hm / 100) * 3600 + (hm % 100) * 60),
-                        [h] => sign * h * 3600,
-                        _ => 0,
-                    }
-                }
-                _ => 0,
-            };
-            (t, off)
-        }
-        None => (rest, 0),
-    };
-    let mut tp = time.split(':');
-    let h: i64 = tp.next()?.parse().ok()?;
-    let mi: i64 = tp.next().unwrap_or("0").parse().ok()?;
-    let sec_s = tp.next().unwrap_or("0");
-    let (whole, frac) = sec_s.split_once('.').unwrap_or((sec_s, ""));
-    let sec: i64 = whole.parse().ok()?;
-    if !(0..=24).contains(&h) || !(0..60).contains(&mi) || !(0..=60).contains(&sec) {
-        return None;
-    }
-    // Its leading digits only (bytes, not characters: whatever else a server sends is no panic).
-    let digits: String = frac.bytes().take_while(u8::is_ascii_digit).take(3).map(char::from).collect();
-    let ms: i64 = format!("{digits:0<3}").parse().unwrap_or(0);
-    // Days since 1970-01-01 (Howard Hinnant's days_from_civil).
-    let y2 = if mo <= 2 { y - 1 } else { y };
-    let era = y2.div_euclid(400);
-    let yoe = y2 - era * 400;
-    let doy = (153 * (if mo > 2 { mo - 3 } else { mo + 9 }) + 2) / 5 + da - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some(((days * 86_400 + h * 3600 + mi * 60 + sec - offset_s) * 1000) + ms)
-}
-
-/// A song's `starred` as the library keeps it: None when not starred (no time given), its time
-/// (Unix ms) when starred, 0 when starred at a time that does not read. A time that does not
-/// read is still a star: taken for none, it would unstar the favourite here.
-pub fn star_time(starred: Option<&str>) -> Option<i64> {
-    starred.map(|t| iso_ms(t).unwrap_or(0))
-}
-
-fn artists(list: &[subsonic::ArtistRef]) -> Vec<RemoteArtist> {
-    list.iter().filter(|a| !a.name.trim().is_empty()).map(|a| RemoteArtist { name: a.name.clone(), mbid: None, sort_name: None }).collect()
-}
-
-fn names(list: &[subsonic::Named], single: &str) -> Vec<String> {
-    let v: Vec<String> = list.iter().filter_map(|n| opt(&n.name)).collect();
-    if v.is_empty() { opt(single).into_iter().collect() } else { v }
-}
-
-/// A server album with its songs, as the library takes it (`remote::RemoteAlbum`).
-pub fn album_of(a: &subsonic::Album) -> RemoteAlbum {
-    let artist = opt(&a.display_artist).unwrap_or_else(|| a.artist.clone());
-    let songs = a.song.iter().filter(|s| !s.is_dir && (s.kind.is_empty() || s.kind == "music")).map(|s| song_of(s, &artist)).collect();
-    RemoteAlbum {
-        id: a.id.clone(),
-        title: a.name.clone(),
-        artist,
-        artists: artists(&a.artists),
-        artist_sort: None,
-        date: a.year.filter(|y| *y > 0).map(|y| format!("{y:04}")),
-        original_date: date(&a.original_release_date),
-        release_date: date(&a.release_date),
-        genres: names(&a.genres, &a.genre),
-        label: a.record_labels.iter().find_map(|l| opt(&l.name)),
-        release_types: a.release_types.iter().filter_map(|t| opt(t)).collect(),
-        compilation: a.is_compilation,
-        mb_album_id: opt(&a.music_brainz_id),
-        created: a.created.as_deref().and_then(iso_ms),
-        cover_art: a.cover_art.clone().filter(|c| !c.trim().is_empty()),
-        starred: a.starred.as_deref().and_then(iso_ms),
-        rating: None,
-        play_count: a.play_count.map(|n| n as i64),
-        songs,
-    }
-}
-
-fn song_of(s: &subsonic::Song, album_artist: &str) -> RemoteSong {
-    let own_album_artist = opt(&s.display_album_artist).filter(|aa| aa != album_artist);
-    RemoteSong {
-        id: s.id.clone(),
-        title: s.title.clone(),
-        artist: opt(&s.display_artist).unwrap_or_else(|| s.artist.clone()),
-        artists: artists(&s.artists),
-        album_artists: if own_album_artist.is_some() { artists(&s.album_artists) } else { Vec::new() },
-        album_artist: own_album_artist,
-        disc: s.disc_number.filter(|d| *d > 0),
-        track: s.track.filter(|t| *t > 0),
-        duration: f64::from(s.duration.unwrap_or(0)),
-        date: s.year.filter(|y| *y > 0).map(|y| format!("{y:04}")),
-        genres: names(&s.genres, &s.genre),
-        mb_recording_id: opt(&s.music_brainz_id),
-        artist_sort: None,
-        created: s.created.as_deref().and_then(iso_ms),
-        suffix: opt(&s.suffix),
-        content_type: opt(&s.content_type),
-        size: s.size.map_or(0, |n| n as i64),
-        bitrate: s.bit_rate.filter(|b| *b > 0),
-        bit_depth: s.bit_depth.and_then(|b| u8::try_from(b).ok()).filter(|b| *b > 0),
-        sample_rate: s.sampling_rate.filter(|r| *r > 0),
-        channels: s.channel_count.and_then(|c| u8::try_from(c).ok()).filter(|c| *c > 0),
-        cover_art: s.cover_art.clone().filter(|c| !c.trim().is_empty()),
-        starred: star_time(s.starred.as_deref()),
-        rating: None,
-        play_count: s.play_count.map(|n| n as i64),
-        path: opt(&s.path),
-    }
 }
 
 // ---- covers --------------------------------------------------------------------------------
@@ -786,8 +650,8 @@ enum Fetched {
 }
 
 fn fetch(client: &Client, art: &ArtCache, cover: &str) -> Fetched {
-    match client.cover_art(cover, Some(library::art::FULL_PX)) {
-        Ok(c) => match art.store(&c.bytes) {
+    match client.cover(cover, library::art::FULL_PX) {
+        Ok(bytes) => match art.store(&bytes) {
             Ok(stem) => Fetched::Stored(stem),
             Err(e) => {
                 log::info!("server cover is not an image the app reads ({e})");
@@ -825,6 +689,11 @@ fn cover_pass(conn: &mut rusqlite::Connection, art: &ArtCache, client: &Client, 
         let mut later = None;
         library::db::let_waiting_in();
         let tx = library::db::write(conn)?;
+        // The account can change while a slow cover request is in flight. Check again
+        // inside the transaction, before recording anything against the current catalog.
+        if c.work.lock().unwrap_or_else(|e| e.into_inner()).generation != generation {
+            return Ok(());
+        }
         let mut done = Vec::new();
         for ((id, cover), r) in batch.iter().zip(results) {
             match r {
@@ -857,44 +726,6 @@ fn cover_pass(conn: &mut rusqlite::Connection, art: &ArtCache, client: &Client, 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn iso_times_read() {
-        assert_eq!(iso_ms("1970-01-01T00:00:00Z"), Some(0));
-        assert_eq!(iso_ms("2024-05-01T10:00:00Z"), Some(1_714_557_600_000));
-        assert_eq!(iso_ms("2024-05-01T10:00:00.123456789Z"), Some(1_714_557_600_123));
-        assert_eq!(iso_ms("2024-05-01T12:00:00+02:00"), Some(1_714_557_600_000));
-        assert_eq!(iso_ms("2024-05-01"), Some(1_714_521_600_000));
-        assert_eq!(iso_ms("2000-02-29T00:00:00Z"), Some(951_782_400_000));
-        assert_eq!(iso_ms("garbage"), None);
-        assert_eq!(iso_ms("2024-13-01T00:00:00Z"), None);
-        // A misbehaving server's: no time, never a panic.
-        assert_eq!(iso_ms("2024-05-01T10:00:00.1éZ"), Some(1_714_557_600_100));
-        assert_eq!(iso_ms("2024-05-01T10:00:00.é1Z"), Some(1_714_557_600_000));
-        assert_eq!(iso_ms("2024-05-01T99999999999999999:00:00Z"), None);
-        assert_eq!(iso_ms("2024-05-01T10:61:00Z"), None);
-        assert_eq!(iso_ms("9223372036854775807-05-01T10:00:00Z"), None);
-        assert_eq!(iso_ms("2024-05-01T10:00:00+9999999999999999:00"), None);
-    }
-
-    #[test]
-    fn an_album_maps_onto_the_library() {
-        let mut a = subsonic::mock::album("al1", "Ann", "Night", 1999, "2024-05-01T10:00:00Z", &[("One", 1, 200, 12345, "Ann/Night/01 One.flac"), ("Two", 2, 180, 0, "")]);
-        a.original_release_date = Some(subsonic::ItemDate { year: Some(1997), month: Some(3), day: Some(21) });
-        a.release_date = Some(subsonic::ItemDate::default());
-        a.music_brainz_id = " MB-1 ".into();
-        a.record_labels = vec![subsonic::Named { name: "Label".into() }];
-        a.song[1].display_album_artist = "Bob".into();
-        a.song.push(subsonic::Song { id: "v".into(), kind: "video".into(), ..Default::default() });
-        let r = album_of(&a);
-        assert_eq!((r.title.as_str(), r.artist.as_str(), r.date.as_deref(), r.original_date.as_deref(), r.release_date.as_deref()), ("Night", "Ann", Some("1999"), Some("1997-03-21"), None));
-        assert_eq!((r.mb_album_id.as_deref(), r.label.as_deref(), r.created, r.cover_art.as_deref()), (Some("MB-1"), Some("Label"), Some(1_714_557_600_000), Some("al-al1")));
-        assert_eq!(r.songs.len(), 2, "music only");
-        let (s0, s1) = (&r.songs[0], &r.songs[1]);
-        assert_eq!((s0.path.as_deref(), s0.size, s0.duration, s0.track, s0.album_artist.as_deref()), (Some("Ann/Night/01 One.flac"), 12345, 200.0, Some(1), None));
-        assert_eq!((s1.path.as_deref(), s1.size, s1.album_artist.as_deref()), (None, 0, Some("Bob")), "no path, no size; its own album artist");
-        assert_eq!(s0.genres, ["Rock"]);
-    }
 
     use subsonic::mock::{self, Mock, Trouble};
 
@@ -937,7 +768,8 @@ mod tests {
         }
         fn job(&self, force: bool) -> Job {
             let (creds, _) = subsonic::sign_in(&self.mock.url, "ann", "pw").unwrap();
-            Job { client: Client::new(creds, true).unwrap(), identity: "mock (ann)".into(), db: self.dir.join("library.db"), force, confirm_removal: false, cancel: Arc::default(), marks: false }
+            let client = Client::Subsonic(subsonic::Client::new(creds, true).unwrap());
+            Job { client, identity: "mock (ann)".into(), db: self.dir.join("library.db"), force, confirm_removal: false, cancel: Arc::default(), marks: false }
         }
         fn run(&self, job: &Job) -> (Outcome, Vec<Step>) {
             let steps = Mutex::new(Vec::new());
@@ -1152,6 +984,20 @@ mod tests {
         assert!(f.mock.count("getAlbum") > 0);
         assert_eq!(remote::server(&f.conn()).unwrap().unwrap().identity, "https://music.example.org (bob)");
         assert_eq!(library::marks::queued_count(&f.conn()).unwrap(), 1);
+    }
+
+    #[test]
+    fn subsonic_ids_cannot_claim_a_retained_plex_catalog() {
+        let f = Fixture::new("plex-collision", library_of(3));
+        let job = f.job(true);
+        assert!(matches!(f.run(&job).0, Outcome::Synced { complete: true, .. }));
+        // Even identical album and track IDs do not establish identity across providers.
+        remote::rename(&mut f.conn(), "plex:another-machine", false).unwrap();
+        f.mock.clear_requests();
+        let (outcome, _) = f.run(&job);
+        assert!(matches!(outcome, Outcome::OtherServer(Elsewhere { songs: 6, .. })), "{outcome:?}");
+        assert_eq!(f.mock.count("getAlbum"), 0);
+        assert_eq!(remote::server(&f.conn()).unwrap().unwrap().identity, "plex:another-machine");
     }
 
     /// The server scanning while it is listed (its list may shift under the pages, and an

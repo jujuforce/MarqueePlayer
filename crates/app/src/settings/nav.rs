@@ -6,6 +6,7 @@
 //! `views` shows the results.
 
 use library::fold::fold;
+use slint::ComponentHandle;
 
 use crate::keys::map::Action;
 
@@ -31,10 +32,10 @@ const SETTINGS: &[(&str, usize, &str)] = &[
     ("Add folder", LIBRARY, "music folders library directory location path remove folder"),
     ("Rescan", LIBRARY, "scan scanning refresh update library status progress unreadable files skipped broken"),
     ("Remove missing tracks", LIBRARY, "held back missing deleted guard prune clean"),
-    ("Server", LIBRARY, "navidrome subsonic opensubsonic server remote network nas home sign in sign out log in connect address url user password account sync catalog streaming"),
+    ("Server", LIBRARY, "plex token navidrome subsonic opensubsonic server remote network nas home sign in sign out log in connect address url user password account sync catalog streaming"),
     ("Sync favourites with the server", LIBRARY, "navidrome subsonic server favourite favorite heart hearts star starred two-way both ways write back"),
     ("Report plays to the server", LIBRARY, "navidrome subsonic server plays play count counts history now playing scrobble scrobbling"),
-    ("Scrobble server tracks from this app", LIBRARY, "navidrome subsonic server last.fm lastfm last fm listenbrainz listen brainz listens scrobbling twice double duplicate"),
+    ("Scrobble server tracks from this app", LIBRARY, "plex navidrome subsonic server last.fm lastfm last fm listenbrainz listen brainz listens scrobbling twice double duplicate"),
     ("Edit tags", LIBRARY, "tag editing editor write change modify fix metadata title artist album cover art picture retag tagger"),
     ("Undo history", LIBRARY, "tag editing undo revert journal edits saves clear disk space size"),
     ("ReplayGain", PLAYBACK, "volume levelling leveling loudness normalize normalise gain track album r128 lufs"),
@@ -45,8 +46,9 @@ const SETTINGS: &[(&str, usize, &str)] = &[
     ("Crossfade length", PLAYBACK, "cross fade seconds duration overlap how long"),
     ("Keep albums gapless", PLAYBACK, "gapless album live mix continuous cross fade"),
     ("Crossfade when skipping", PLAYBACK, "skip next previous manual cross fade"),
-    ("Keep downloaded tracks", PLAYBACK, "navidrome subsonic server music from the server streaming stream cache downloads downloaded offline disk space size limit cap"),
-    ("Downloaded tracks", PLAYBACK, "navidrome subsonic server music from the server streaming stream cache downloads clear delete free disk space size"),
+    ("Streaming quality", PLAYBACK, "plex navidrome subsonic server music bitrate kbps mp3 bandwidth remote mobile data hotspot"),
+    ("Keep downloaded tracks", PLAYBACK, "plex navidrome subsonic server music from the server streaming stream cache downloads downloaded offline disk space size limit cap"),
+    ("Downloaded tracks", PLAYBACK, "plex navidrome subsonic server music from the server streaming stream cache downloads clear delete free disk space size"),
     ("Equalizer", EQUALIZER, "eq equaliser equalization equalisation sound tone bass treble presets graphic parametric sliders bands autoeq headphones correction"),
     ("Equalizer preamp", EQUALIZER, "eq equaliser headroom clipping gain auto"),
     ("Separate setting for this device", EQUALIZER, "eq equaliser headphones speakers per device output device own preset"),
@@ -107,8 +109,11 @@ fn offered(label: &str) -> bool {
         "Start with Windows" => crate::platform::integration::autostart(edition).is_some(),
         "Default app for music files" => crate::platform::integration::default_apps_available(edition),
         "Animated tray icon" => crate::platform::system::TRAY_ANIMATES,
+        "Sync favourites with the server" | "Report plays to the server" => {
+            crate::state::with(|st| st.app.upgrade().is_none_or(|app| !app.global::<crate::Server>().get_plex())).unwrap_or(true)
+        }
         // Settings > Playback > Music from the server, shown once there is a server or a cache.
-        "Keep downloaded tracks" | "Downloaded tracks" => crate::server::streaming::settings_shown(),
+        "Streaming quality" | "Keep downloaded tracks" | "Downloaded tracks" => crate::server::streaming::settings_shown(),
         _ => true,
     }
 }
@@ -204,6 +209,7 @@ mod tests {
         assert_eq!(labels("love"), vec!["Love favourites on ListenBrainz"]);
         assert_eq!(find("listen brainz token")[0], Hit { label: "ListenBrainz".into(), section: CONNECTIONS });
         assert_eq!(labels("favourites server"), vec!["Sync favourites with the server"]);
+        assert_eq!(labels("plex token"), vec!["Server"]);
         assert_eq!(labels("hearts navidrome"), vec!["Sync favourites with the server"]);
         assert_eq!(find("play counts")[0], Hit { label: "Report plays to the server".into(), section: LIBRARY });
         assert_eq!(labels("discord"), vec!["Show on Discord", "Application ID"]);
@@ -231,7 +237,9 @@ mod tests {
         assert_eq!(shown("stream cache"), vec![("Keep downloaded tracks".to_owned(), PLAYBACK), ("Downloaded tracks".to_owned(), PLAYBACK)]);
         assert!(shown("navidrome").iter().any(|(l, _)| l == "Server"), "the server first of all");
         assert!(shown("disk space").contains(&("Downloaded tracks".to_owned(), PLAYBACK)));
-        let hidden = |q: &str| find_in(q, |l| !matches!(l, "Keep downloaded tracks" | "Downloaded tracks"));
+        assert!(shown("bitrate").contains(&("Streaming quality".to_owned(), PLAYBACK)));
+        let hidden = |q: &str| find_in(q, |l| !matches!(l, "Streaming quality" | "Keep downloaded tracks" | "Downloaded tracks"));
+        assert!(hidden("bitrate").iter().all(|hit| hit.label != "Streaming quality"));
         assert!(hidden("stream cache").is_empty());
     }
 

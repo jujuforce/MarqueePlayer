@@ -1,4 +1,4 @@
-//! A secret kept on disk (the server's token, `server/navidrome.rs`), sealed with DPAPI for the current
+//! A secret kept on disk (the server's token, `server/account.rs`), sealed with DPAPI for the current
 //! Windows user (`CryptProtectData`): only this user on this PC can open it again. Copied to
 //! another PC (the portable edition's drive) or another account, it does not open, and the app
 //! asks to sign in again. The file itself is written as any other.

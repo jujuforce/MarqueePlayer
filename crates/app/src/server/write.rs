@@ -82,7 +82,7 @@ pub fn view_of_starred(kept: impl IntoIterator<Item = String>, starred: &[subson
     let mut v: View = kept.into_iter().map(|id| (id, Seen { starred: Some(None) })).collect();
     for s in starred {
         // Listed among the stars: starred, whatever its time says.
-        let at = crate::server::sync::star_time(s.starred.as_deref()).unwrap_or(0);
+        let at = crate::server::provider::star_time(s.starred.as_deref()).unwrap_or(0);
         v.insert(s.id.clone(), Seen { starred: Some(Some(at)) });
     }
     v
@@ -261,6 +261,15 @@ fn flush_plays_while(conn: &Connection, client: &Client, live: &dyn Fn() -> bool
     }
 }
 
+/// A disconnected Subsonic catalog still queues changes for the next sign-in. Plex is read-only.
+fn catalog_supports_writes(conn: &Connection) -> rusqlite::Result<bool> {
+    Ok(library::remote::server(conn)?.is_some_and(|s| !super::provider::is_plex_identity(&s.identity)))
+}
+
+pub fn reports_plays(settings: &crate::settings::Settings, conn: &Connection) -> rusqlite::Result<bool> {
+    Ok(settings.server_plays && catalog_supports_writes(conn)?)
+}
+
 /// The library's catalog is this client's server and user (`remote::server`'s identity), so
 /// what is sent is about the songs it has.
 fn holds_catalog_of(conn: &Connection, client: &Client) -> bool {
@@ -424,8 +433,10 @@ pub fn writes_of(s: &crate::settings::Settings) -> Writes {
 /// A sync ended having read `view` of the server's own values: the pass, and the plays queued.
 pub fn after_sync(view: View) {
     kick(|w| {
-        w.pass = Some(view);
-        w.plays = true;
+        if w.client.is_some() {
+            w.pass = Some(view);
+            w.plays = true;
+        }
     });
 }
 
@@ -435,7 +446,10 @@ pub fn changed(st: &Rc<State>, id: i64) {
     if id < 0 || !st.settings.borrow().server_marks {
         return;
     }
-    match marks::touched(&st.db, id) {
+    let touched = catalog_supports_writes(&st.db).and_then(|supported| {
+        if supported { marks::touched(&st.db, id) } else { Ok(None) }
+    });
+    match touched {
         Ok(Some(_)) => kick(|w| {
             if !w.tracks.contains(&id) {
                 w.tracks.push(id);
@@ -520,7 +534,8 @@ mod tests {
         }
         /// A sync (listing the catalog when `force`), and what it read of the server's values.
         fn sync(&self, force: bool, marks: bool) -> View {
-            let job = Job { client: self.client(Writes::NONE), identity: "mock (ann)".into(), db: self.dir.join("library.db"), force, confirm_removal: false, cancel: Arc::default(), marks };
+            let client = crate::server::provider::Client::Subsonic(self.client(Writes::NONE));
+            let job = Job { client, identity: "mock (ann)".into(), db: self.dir.join("library.db"), force, confirm_removal: false, cancel: Arc::default(), marks };
             match run(&job, &|_| {}) {
                 Outcome::Synced { seen, .. } | Outcome::UpToDate(seen) => seen,
                 o => panic!("{o:?}"),
@@ -669,8 +684,8 @@ mod tests {
     /// A star whose time does not read is a star, read from the album or from the stars alone.
     #[test]
     fn a_star_with_a_time_that_does_not_read_is_a_star() {
-        assert_eq!(crate::server::sync::star_time(Some("yesterday")), Some(0));
-        assert_eq!(crate::server::sync::star_time(None), None);
+        assert_eq!(crate::server::provider::star_time(Some("yesterday")), Some(0));
+        assert_eq!(crate::server::provider::star_time(None), None);
         let f = Fixture::new("odd-time");
         f.mock.edit(|l| l.song_mut("al0-1").unwrap().starred = Some("not a time".into()));
         let listed = f.sync(true, true);

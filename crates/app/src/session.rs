@@ -70,14 +70,15 @@ fn save_plays(st: &Rc<State>, force: bool) -> bool {
         let _ = library::db::set_wait(&st.db, library::db::Wait::Brief);
     }
     // Plays of tracks the server has are queued for it with the play (`server/write.rs`).
-    let to_server = st.settings.borrow().server_plays;
-    let result = library::query::record_plays_for(&st.db, &mut sv.plays, to_server);
+    let result = crate::server::write::reports_plays(&st.settings.borrow(), &st.db).and_then(|to_server| {
+        library::query::record_plays_for(&st.db, &mut sv.plays, to_server).map(|n| (n, to_server))
+    });
     let _ = library::db::set_wait(&st.db, library::db::Wait::Long);
     let left = sv.plays.len();
     drop(sv);
     match result {
         // Smart playlists on plays (never played, most played...) follow.
-        Ok(n) => {
+        Ok((n, to_server)) => {
             if n > 0 {
                 crate::playlists::smart::changed(st);
                 if to_server {

@@ -24,6 +24,8 @@
 //! never from https to http; ureq to anywhere). Nothing here logs, and no error message
 //! carries a URL: the Subsonic client's URLs hold its token.
 
+pub mod audio;
+
 use std::ops::ControlFlow;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +74,57 @@ pub struct BinaryResponse {
     pub content_type: Option<String>,
     pub retry_after: Option<u64>,
     pub rate_limit: RateLimit,
+}
+
+/// The base address of a user-configured server. Keep reverse proxy paths, drop the query
+/// and fragment, and strip a known endpoint suffix when an address was pasted from a browser.
+/// An address with userinfo is never retained, as this value may be displayed in Settings.
+pub fn normalize_base_url(input: &str, endpoint_suffixes: &[&str]) -> Option<String> {
+    let s = input.trim();
+    if s.is_empty() || s.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let (scheme, rest) = match s.split_once("://") {
+        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
+        None => ("https".to_owned(), s),
+    };
+    if scheme != "https" && scheme != "http" {
+        return None;
+    }
+    let rest = rest.split(['?', '#']).next().unwrap_or("");
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
+    };
+    if authority.contains('@') {
+        return None;
+    }
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) if !p.contains(']') => (h, Some(p)),
+        _ => (authority, None),
+    };
+    let host_ok = if let Some(v6) = host.strip_prefix('[') {
+        v6.strip_suffix(']').is_some_and(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.'))
+    } else {
+        !host.is_empty() && host.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '.' | '_'))
+    };
+    if !host_ok {
+        return None;
+    }
+    let port = match port {
+        Some(p) => Some(p.parse::<u16>().ok().filter(|&n| n > 0)?),
+        None => None,
+    };
+    let mut path = path.trim_end_matches('/');
+    if let Some(p) = endpoint_suffixes.iter().find_map(|suffix| path.strip_suffix(suffix)) {
+        path = p.trim_end_matches('/');
+    }
+    let mut url = format!("{scheme}://{}", host.to_lowercase());
+    if let Some(p) = port {
+        url.push_str(&format!(":{p}"));
+    }
+    url.push_str(path);
+    Some(url)
 }
 
 /// One request.

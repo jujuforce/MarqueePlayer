@@ -42,7 +42,7 @@ fn open(args: &[&OsStr]) -> bool {
             true
         }
         Err(e) => {
-            log::warn!("open {args:?}: {e}");
+            log::warn!("could not start open: {e}");
             false
         }
     }

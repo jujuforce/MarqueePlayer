@@ -37,7 +37,8 @@ pub mod models;
 pub use auth::{Credentials, is_plain_http, new_salt, normalize_url, token};
 pub use client::{
     API_VERSION, AlbumList, CLIENT_NAME, Client, Cover, MARK_ENDPOINTS, PLAY_ENDPOINTS, PLAYLIST_ENDPOINTS, PlaylistUpdate, Quality, READ_ENDPOINTS, STREAM_TIMEOUT_MS,
-    Search, StreamHead, StreamSink, Streamed, TIMEOUT_MS, Writes, sign_in,
+    Search, TIMEOUT_MS, Writes, sign_in,
 };
 pub use error::Error;
+pub use http_client::audio::{StreamHead, StreamSink, Streamed};
 pub use models::*;

@@ -1,8 +1,8 @@
-//! Settings > Library > Server: a Navidrome (or other Subsonic) server as a library source
+//! Settings > Library > Server: a Plex or Subsonic server as a library source
 //! beside the music folders (docs/features/navidrome.md). This is the UI thread's side: signing in and
 //! out, when a sync runs and what Settings, the sidebar and the pill say of it. The work is
 //! `server/sync.rs`'s, on threads of its own; the database side `library::remote`'s; the sign-in
-//! kept between runs `server/navidrome.rs`'s.
+//! kept between runs `server/account.rs`'s.
 //!
 //! **The client is read-only** (`Client::new(.., true)`) for the sync, the covers and streaming.
 //! Only `server/write.rs` writes, with a client allowed the kinds the switches below allow
@@ -27,10 +27,14 @@
 //! stored sign-in and (with streaming) the stream cache. Nothing of the folders' music changes.
 //!
 //! The area's files: `sync` (the work on threads), `write` (the writes the switches allow),
-//! `navidrome` (the sign-in kept between runs), `streaming` (tracks played as they download)
+//! `account` (the sign-in kept between runs), `streaming` (tracks played as they download)
 //! and `streammock` (a stand-in server for the tests and the bench).
 
-pub(crate) mod navidrome;
+pub(crate) mod account;
+pub(crate) mod browser;
+pub(crate) mod libraries;
+pub(crate) mod plex;
+pub(crate) mod provider;
 pub(crate) mod streaming;
 #[cfg(any(test, feature = "bench"))]
 pub(crate) mod streammock;
@@ -46,9 +50,9 @@ use std::time::{Duration, Instant};
 
 use library::remote;
 use slint::ComponentHandle;
-use subsonic::{Client, Credentials, Error};
+use subsonic::Error;
 
-use crate::server::navidrome::{About, Loaded};
+use crate::server::account::{About, Account, Loaded, Session};
 use crate::scanning::count;
 use crate::server::sync::{Job, Outcome, Step};
 use crate::state::{self, State};
@@ -111,13 +115,13 @@ pub fn host_of(url: &str) -> String {
     rest.trim_end_matches('/').to_owned()
 }
 
-/// `host_of` the catalog in the library (its identity is "address (user)"); "" with none.
-fn catalog_host(conn: &rusqlite::Connection) -> String {
-    remote::server(conn)
-        .ok()
-        .flatten()
-        .map(|s| host_of(s.identity.split_once(" (").map_or(s.identity.as_str(), |(url, _)| url)))
-        .unwrap_or_default()
+/// The server to name on retained tracks while signed out. Plex identities do not store an address.
+fn catalog_host(catalog: Option<&remote::Server>) -> String {
+    let Some(catalog) = catalog else { return String::new() };
+    if provider::is_plex_identity(&catalog.identity) {
+        return "Plex Media Server".into();
+    }
+    host_of(catalog.identity.split_once(" (").map_or(catalog.identity.as_str(), |(url, _)| url))
 }
 
 /// What a sync kept in the library until the user confirms its removal (Settings' "Remove it
@@ -133,10 +137,14 @@ pub enum Hold {
 #[derive(Default)]
 struct Ctl {
     /// Signed in: what signs requests, what the server is, and the client made of them.
-    signed_in: Option<(Credentials, About, Client)>,
+    signed_in: Option<Session>,
+    /// A new account can sync while another account's retained catalog awaits confirmation.
+    catalog_active: bool,
     /// Bumped by each Connect and Sign out: an older sign-in's answer is dropped.
     attempt: u64,
     signing_in: bool,
+    plex_login: Option<browser::Login>,
+    plex_libraries: Vec<plex::MusicLibrary>,
     /// The running sync's Stop, its reason and generation.
     sync: Option<(Arc<AtomicBool>, Reason, u64)>,
     generation: u64,
@@ -165,19 +173,42 @@ fn with<R>(f: impl FnOnce(&mut Ctl) -> R) -> R {
 }
 
 /// The library's identity for this server and user (`remote::sync`): one catalog at a time.
-pub(crate) fn identity(c: &Credentials) -> String {
-    format!("{} ({})", c.url, c.user)
+pub(crate) fn identity(c: &subsonic::Credentials) -> String {
+    account::subsonic_identity(&c.url, &c.user)
 }
 
-/// The one place the app learns that it is connected with this client, or signed out (`None`):
-/// at start with the stored sign-in, after a sign-in, after signing out, and when the server
-/// refuses the stored sign-in. The covers thread is told here; so is playback's streaming once
-/// it is joined (`crate::server::streaming::set_client`). The client is read-only; the writes' thread
-/// adds the kinds the switches allow to its own copy (`write::set_writes`).
-fn set_client(client: Option<Client>) {
-    sync::covers_client(client.clone());
-    crate::server::write::set_client(client.clone());
-    crate::server::streaming::set_client(client);
+/// Playback, covers and writeback may use a connection only once its catalog is the one
+/// shown in the library. Sync alone gets the new connection while replacement is pending.
+fn update_catalog_clients(st: &State) {
+    let stored = remote::server(&st.db);
+    let changed = with(|c| {
+        let active = c.signed_in.as_ref().is_some_and(|s| match &stored {
+            Ok(Some(catalog)) => catalog.identity == s.account.identity(),
+            Ok(None) => true,
+            Err(_) => false,
+        });
+        if c.catalog_active == active {
+            return None;
+        }
+        c.catalog_active = active;
+        c.asked.clear();
+        Some(c.signed_in.as_ref().filter(|_| active).map(|s| s.client.clone()))
+    });
+    if let Some(client) = changed {
+        sync::covers_client(client.clone());
+        write::set_client(client.as_ref().and_then(|c| c.as_subsonic()).cloned());
+        streaming::set_client(client);
+    }
+}
+
+fn restore_fields(st: &State, account: &Account) {
+    if let Some(app) = st.app.upgrade() {
+        let s = app.global::<crate::Server>();
+        s.set_plex(account.is_plex());
+        s.set_plain_http(subsonic::is_plain_http(&account.url));
+        s.set_address(account.url.as_str().into());
+        s.set_user(account.user().into());
+    }
 }
 
 pub fn install(st: &Rc<State>) {
@@ -185,41 +216,33 @@ pub fn install(st: &Rc<State>) {
     sync::covers_start(st.paths.database(), art, |ids| state::post(move |st| covers_written(st, &ids)));
     crate::server::write::start(st.paths.database(), |changes| state::post(move |st| crate::server::write::apply(st, &changes)));
     crate::server::write::set_writes(crate::server::write::writes_of(&st.settings.borrow()));
-    let loaded = navidrome::load(&navidrome::path(&st.paths.data));
+    let loaded = account::load(&account::path(&st.paths.data));
     let f = facts(&st.db);
-    let host = catalog_host(&st.db);
+    let retained = remote::server(&st.db).ok().flatten();
+    if let Some(catalog) = &retained && let Some(app) = st.app.upgrade() {
+        app.global::<crate::Server>().set_plex(provider::is_plex_identity(&catalog.identity));
+    }
     with(|c| {
         c.facts = f;
-        c.catalog_host = host;
+        c.catalog_host = catalog_host(retained.as_ref());
     });
-    let mut fields = None;
     match loaded {
-        Loaded::SignedIn { credentials, about } => match Client::new(credentials.clone(), true) {
-            Ok(client) => {
-                with(|c| c.signed_in = Some((credentials, about, client.clone())));
-                set_client(Some(client));
-            }
-            Err(_) => fields = Some((credentials.url, credentials.user)),
-        },
-        Loaded::Locked { url, user } => {
+        Loaded::SignedIn(session) => {
+            with(|c| c.signed_in = Some(*session));
+            update_catalog_clients(st);
+        }
+        Loaded::Locked(account) => {
             with(|c| {
                 c.problem = Some((
                     "The saved sign-in was made on another computer or for another Windows account, and cannot be read here. Sign in again to keep the server's music up to date.".into(),
                     true,
                 ))
             });
-            fields = Some((url, user));
+            restore_fields(st, &account);
         }
         Loaded::None => {}
     }
-    if let Some((url, user)) = fields
-        && let Some(app) = st.app.upgrade()
-    {
-        let s = app.global::<crate::Server>();
-        s.set_plain_http(subsonic::is_plain_http(&url));
-        s.set_address(url.into());
-        s.set_user(user.into());
-    }
+    libraries::restore(st);
     show(st);
 }
 
@@ -252,14 +275,17 @@ pub fn address_edited(st: &Rc<State>, text: &str) {
 pub fn connect(st: &Rc<State>, url: &str, user: &str, password: &str) {
     let Some(app) = st.app.upgrade() else { return };
     let s = app.global::<crate::Server>();
-    if with(|c| c.signing_in || c.signing_out) {
+    let plex = s.get_plex();
+    if with(|c| c.signed_in.is_some() || c.signing_in || c.signing_out || c.plex_login.is_some()) {
         return;
     }
     let (url, user) = (url.trim().to_owned(), user.trim().to_owned());
     let missing = if url.is_empty() {
         Some("Type the server's address: the one you open it at in a browser.")
-    } else if user.is_empty() {
+    } else if !plex && user.is_empty() {
         Some("Type your user name on the server.")
+    } else if plex && password.trim().is_empty() {
+        Some("Enter your Plex access token.")
     } else if password.is_empty() {
         Some("Type your password on the server.")
     } else {
@@ -270,11 +296,11 @@ pub fn connect(st: &Rc<State>, url: &str, user: &str, password: &str) {
         return;
     }
     if let Err(e) = subsonic::normalize_url(&url) {
-        s.set_error(sign_in_words(&e).into());
+        s.set_error(sign_in_words(&e, plex).into());
         return;
     }
     let password = password.to_owned();
-    // The field lets go of it at once; the thread drops it once the token is made.
+    // Clear the field before handing the secret to the sign-in thread.
     s.set_password("".into());
     s.set_error("".into());
     s.set_signing_in(true);
@@ -285,9 +311,9 @@ pub fn connect(st: &Rc<State>, url: &str, user: &str, password: &str) {
     });
     log::info!("server: signing in");
     let spawned = std::thread::Builder::new().name("mp-server-signin".into()).spawn(move || {
-        let result = subsonic::sign_in(&url, &user, &password);
+        let result = account::sign_in(plex, &url, &user, &password);
         drop(password);
-        state::post(move |st| signed_in(st, attempt, result));
+        state::post(move |st| signed_in(st, attempt, plex, result));
     });
     if let Err(e) = spawned {
         with(|c| c.signing_in = false);
@@ -296,7 +322,7 @@ pub fn connect(st: &Rc<State>, url: &str, user: &str, password: &str) {
     }
 }
 
-fn signed_in(st: &Rc<State>, attempt: u64, result: Result<(Credentials, subsonic::ServerInfo), Error>) {
+fn signed_in(st: &Rc<State>, attempt: u64, plex: bool, result: Result<(Session, String), Error>) {
     if with(|c| c.attempt != attempt) {
         return;
     }
@@ -305,37 +331,39 @@ fn signed_in(st: &Rc<State>, attempt: u64, result: Result<(Credentials, subsonic
     let s = app.global::<crate::Server>();
     s.set_signing_in(false);
     match result {
-        Ok((credentials, info)) => {
-            let about = About::of(&info);
-            let client = match Client::new(credentials.clone(), true) {
-                Ok(c) => c,
-                Err(e) => {
-                    s.set_error(sign_in_words(&e).into());
-                    return;
-                }
-            };
-            log::info!("server: signed in ({})", about.describe());
-            if !navidrome::save(&navidrome::path(&st.paths.data), &credentials, &about) {
-                views::flash_long(st, "Signed in, but the sign-in could not be saved: the next start asks for it again");
-            }
-            with(|c| {
-                c.signed_in = Some((credentials, about, client.clone()));
-                c.problem = None;
-                c.held = None;
-            });
-            s.set_error("".into());
-            set_client(Some(client));
-            show(st);
-            sync(st, Reason::SignIn);
+        Ok((session, secret)) => {
+            start_session(st, session, &secret);
         }
         Err(e) => {
             log::info!("server: sign-in failed ({})", class(&e));
-            s.set_error(sign_in_words(&e).into());
+            s.set_error(sign_in_words(&e, plex).into());
         }
     }
 }
 
-/// Home's "Connect Navidrome": Settings > Library, with the sign-in scrolled into view and its
+fn start_session(st: &Rc<State>, session: Session, secret: &str) {
+    log::info!("server: signed in ({})", session.about.describe());
+    if !account::save(&account::path(&st.paths.data), &session, secret) {
+        views::flash_long(st, "Signed in, but the sign-in could not be saved: the next start asks for it again");
+    }
+    with(|c| {
+        c.signed_in = Some(session);
+        c.problem = None;
+        c.held = None;
+    });
+    if let Some(app) = st.app.upgrade() {
+        let s = app.global::<crate::Server>();
+        s.set_password("".into());
+        s.set_error("".into());
+        s.set_plex_manual(false);
+    }
+    update_catalog_clients(st);
+    libraries::restore(st);
+    show(st);
+    sync(st, Reason::SignIn);
+}
+
+/// Home's "Connect a server": Settings > Library, with the sign-in scrolled into view and its
 /// address field focused (the card does that once it is laid out: `SettingsView.focus-server`).
 pub fn open_sign_in(st: &Rc<State>) {
     views::settings_section(st, crate::settings::nav::LIBRARY);
@@ -372,7 +400,7 @@ pub fn stop(st: &Rc<State>) {
 }
 
 pub fn sync(st: &Rc<State>, reason: Reason) {
-    let Some((credentials, client)) = with(|c| c.signed_in.as_ref().map(|s| (s.0.clone(), s.2.clone()))) else { return };
+    let Some((identity, client)) = with(|c| c.signed_in.as_ref().map(|s| (s.account.identity(), s.client.clone()))) else { return };
     if with(|c| c.signing_out) {
         return;
     }
@@ -395,13 +423,13 @@ pub fn sync(st: &Rc<State>, reason: Reason) {
         c.generation
     });
     let job = Job {
+        marks: client.as_subsonic().is_some() && st.settings.borrow().server_marks,
         client,
-        identity: identity(&credentials),
+        identity,
         db: st.paths.database(),
         force: reason.force(),
         confirm_removal: reason == Reason::Confirm,
         cancel,
-        marks: st.settings.borrow().server_marks,
     };
     log::info!("server sync: {reason:?}");
     show(st);
@@ -431,6 +459,10 @@ fn progressed(st: &Rc<State>, generation: u64, step: Step) {
         views::library_changed_live(st);
         return;
     }
+    if let Step::PlexLibraries(choices) = step {
+        libraries::present(st, choices);
+        return;
+    }
     with(|c| c.step = Some(step));
     show(st);
 }
@@ -441,8 +473,10 @@ fn finished(st: &Rc<State>, generation: u64, outcome: Outcome) {
         c.step = None;
         c.checked = Some(Instant::now());
     });
+    update_catalog_clients(st);
     let mut pill: Option<String> = None;
     match outcome {
+        Outcome::ChoosePlexLibrary(choices) => libraries::choose_or_prompt(st, choices),
         Outcome::UpToDate(seen) => {
             crate::server::write::after_sync(seen);
             log::info!("server sync: up to date (no scan on the server since the last sync)");
@@ -521,7 +555,7 @@ fn finished(st: &Rc<State>, generation: u64, outcome: Outcome) {
             pill = Some(format!("Sync failed: {e}"));
         }
     }
-    let (f, host) = (facts(&st.db), catalog_host(&st.db));
+    let (f, host) = (facts(&st.db), catalog_host(remote::server(&st.db).ok().flatten().as_ref()));
     with(|c| {
         c.facts = f;
         c.catalog_host = host;
@@ -549,17 +583,16 @@ fn refresh_library(st: &Rc<State>) {
 /// The server refused the stored sign-in: signed out of it (its music stays, as last synced),
 /// asking to sign in again.
 fn lost_sign_in(st: &Rc<State>) {
-    let creds = with(|c| c.signed_in.take().map(|s| s.0));
-    set_client(None);
-    navidrome::remove(&navidrome::path(&st.paths.data));
+    let account = with(|c| c.signed_in.take().map(|s| s.account));
+    libraries::restore(st);
+    update_catalog_clients(st);
+    account::remove(&account::path(&st.paths.data));
     with(|c| {
         c.pending = None;
-        c.problem = Some(("The server no longer accepts the saved sign-in (was the password changed?). Sign in again to keep its music up to date.".into(), true));
+        c.problem = Some(("The server no longer accepts the saved sign-in. Sign in again to keep its music up to date.".into(), true));
     });
-    if let (Some(c), Some(app)) = (creds, st.app.upgrade()) {
-        let s = app.global::<crate::Server>();
-        s.set_address(c.url.into());
-        s.set_user(c.user.into());
+    if let Some(account) = account {
+        restore_fields(st, &account);
     }
 }
 
@@ -568,6 +601,7 @@ pub fn sign_out(st: &Rc<State>) {
     if with(|c| c.signing_out) {
         return;
     }
+    browser::cancel(st);
     with(|c| {
         if let Some((cancel, ..)) = &c.sync {
             cancel.store(true, Ordering::Relaxed);
@@ -582,12 +616,13 @@ pub fn sign_out(st: &Rc<State>) {
         c.held = None;
         c.step = None;
     });
-    set_client(None);
-    navidrome::remove(&navidrome::path(&st.paths.data));
+    update_catalog_clients(st);
+    account::remove(&account::path(&st.paths.data));
     // Nothing of the sign-in stays in its fields either: not the address and user name (kept only
     // when the server lost the sign-in, to sign in again with: `lost_sign_in`).
     if let Some(app) = st.app.upgrade() {
         let s = app.global::<crate::Server>();
+        s.set_plex(false);
         s.set_address("".into());
         s.set_user("".into());
         s.set_password("".into());
@@ -595,6 +630,7 @@ pub fn sign_out(st: &Rc<State>) {
         s.set_error("".into());
     }
     // The stream cache goes with the sign-in.
+    libraries::restore(st);
     crate::server::streaming::clear_cache();
     log::info!("server: signed out; removing its music from the library");
     show(st);
@@ -616,7 +652,7 @@ fn signed_out(st: &Rc<State>, result: Result<usize, String>) {
     with(|c| {
         c.signing_out = false;
         c.facts = facts(&st.db);
-        c.catalog_host = catalog_host(&st.db);
+        c.catalog_host = catalog_host(remote::server(&st.db).ok().flatten().as_ref());
     });
     match result {
         Ok(n) => {
@@ -709,8 +745,11 @@ pub fn class(e: &Error) -> &'static str {
 }
 
 /// Why a sign-in did not work, and what to do.
-pub fn sign_in_words(e: &Error) -> String {
+pub fn sign_in_words(e: &Error, plex: bool) -> String {
     match e {
+        Error::NotPermitted(_) if plex => "This token cannot access a music library. Check which music libraries this account can open in Plex.".into(),
+        Error::WrongCredentials { .. } if plex => "Plex refused that access token. Enter a token with access to this server.".into(),
+        Error::BadUrl | Error::NotFound(_) | Error::NotSubsonic(_) if plex => "Enter the address of your Plex Media Server, such as http://192.168.1.10:32400.".into(),
         Error::BadUrl => "That is not a server address. Type it as you would in a browser: https://music.example.org, or http://192.168.1.10:4533 on your network.".into(),
         Error::Network(m) => format!("No answer from that address ({m}). Check it, and that the server is running and can be reached from this computer."),
         Error::NotSubsonic(m) => {
@@ -750,7 +789,7 @@ pub fn ago(ms: i64) -> String {
 
 /// The status card: (title, text) when signed in and idle.
 pub fn describe(user: &str, about: &About, f: &Facts, plain_http: bool, now_ms: i64) -> (String, String) {
-    let title = format!("Signed in as {user} on {}", about.describe());
+    let title = if user.is_empty() { format!("Connected to {}", about.describe()) } else { format!("Signed in as {user} on {}", about.describe()) };
     let on_server = f.counts.server + f.counts.both;
     let mut text = if on_server == 0 && f.synced_at.is_none() {
         "Not synced yet.".to_owned()
@@ -782,7 +821,7 @@ pub fn describe_step(step: &Step) -> (String, String, f32, String) {
     let title = "Syncing with the server".to_owned();
     match step {
         Step::Replacing => (title, "Removing the other server's music from the library first\u{2026}".into(), -1.0, "Syncing\u{2026}".into()),
-        Step::Asking => (title, "Asking the server what changed\u{2026}".into(), -1.0, "Syncing\u{2026}".into()),
+        Step::Asking | Step::PlexLibraries(_) => (title, "Asking the server what changed\u{2026}".into(), -1.0, "Syncing\u{2026}".into()),
         Step::Listing { albums } => (title, format!("Listing the server's albums: {} so far", count(*albums)), -1.0, "Syncing\u{2026}".into()),
         Step::Reading { done, total } => {
             let p = if *total > 0 { *done as f32 / *total as f32 } else { -1.0 };
@@ -837,6 +876,9 @@ pub fn show(st: &Rc<State>) {
     }
     CTL.with(|c| {
         let c = c.borrow();
+        if let Some(session) = &c.signed_in {
+            s.set_plex(session.account.is_plex());
+        }
         s.set_signed_in(c.signed_in.is_some());
         s.set_signing_in(c.signing_in);
         s.set_busy(c.sync.is_some() || c.signing_out);
@@ -844,9 +886,9 @@ pub fn show(st: &Rc<State>) {
         s.set_held(c.held.as_ref().map(hold_text).unwrap_or_default().into());
         // The cloud's tooltip: the server signed in to, or the one whose music is still shown.
         let host = match &c.signed_in {
-            Some((creds, ..)) => host_of(&creds.url),
-            None if c.facts.connected => c.catalog_host.clone(),
-            None => String::new(),
+            Some(session) if c.catalog_active => host_of(&session.account.url),
+            _ if c.facts.connected => c.catalog_host.clone(),
+            _ => String::new(),
         };
         s.set_host(host.into());
         let (problem, attention) = c.problem.clone().unwrap_or_default();
@@ -864,8 +906,8 @@ pub fn show(st: &Rc<State>) {
             s.set_detail("".into());
             s.set_progress(progress);
             s.set_short(short.into());
-        } else if let Some((creds, about, _)) = &c.signed_in {
-            let (title, text) = describe(&creds.user, about, &c.facts, subsonic::is_plain_http(&creds.url), library::db::now_ms());
+        } else if let Some(session) = &c.signed_in {
+            let (title, text) = describe(session.account.user(), &session.about, &c.facts, subsonic::is_plain_http(&session.account.url), library::db::now_ms());
             s.set_title(title.into());
             s.set_status(text.into());
             s.set_detail(problem.clone().into());
@@ -899,7 +941,7 @@ pub fn sources_line(c: &remote::Counts) -> String {
 /// address or the user.
 pub fn diagnostics_line(st: &Rc<State>) -> String {
     let f = facts(&st.db);
-    let (signed_in, about) = with(|c| (c.signed_in.is_some(), c.signed_in.as_ref().map(|s| s.1.describe())));
+    let (signed_in, about) = with(|c| (c.signed_in.is_some(), c.signed_in.as_ref().map(|s| s.about.describe())));
     let state = match (signed_in, f.connected) {
         (true, _) => format!("signed in to {}", about.unwrap_or_default()),
         (false, true) => "signed out, its music still in the library".into(),
@@ -919,11 +961,11 @@ mod tests {
 
     #[test]
     fn errors_are_worded_by_their_class() {
-        assert!(sign_in_words(&Error::BadUrl).contains("not a server address"));
-        assert!(sign_in_words(&Error::Network("timed out".into())).starts_with("No answer from that address (timed out)"));
-        assert!(sign_in_words(&Error::NotSubsonic("a web page or XML".into())).contains("/navidrome"));
-        assert_eq!(sign_in_words(&Error::WrongCredentials { code: 40, message: "x".into() }), "The server did not accept that user name and password.");
-        assert!(sign_in_words(&Error::WrongCredentials { code: 41, message: "x".into() }).contains("LDAP"));
+        assert!(sign_in_words(&Error::BadUrl, false).contains("not a server address"));
+        assert!(sign_in_words(&Error::Network("timed out".into()), false).starts_with("No answer from that address (timed out)"));
+        assert!(sign_in_words(&Error::NotSubsonic("a web page or XML".into()), false).contains("/navidrome"));
+        assert_eq!(sign_in_words(&Error::WrongCredentials { code: 40, message: "x".into() }, false), "The server did not accept that user name and password.");
+        assert!(sign_in_words(&Error::WrongCredentials { code: 41, message: "x".into() }, false).contains("LDAP"));
         assert!(sync_words(&Error::Network("refused".into())).contains("as last synced"));
         assert!(sync_words(&Error::Server { code: None, http_status: Some(503), message: String::new() }).contains("HTTP 503"));
         assert_eq!(class(&Error::Network("https://secret.example/".into())), "no connection", "the log never gets the text");

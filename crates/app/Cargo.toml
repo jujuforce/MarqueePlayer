@@ -30,6 +30,7 @@ bench-opengl = ["bench", "slint/renderer-skia-opengl"]
 marquee-ui = { path = "../ui" }
 player-core = { path = "../player-core" }
 library = { path = "../library" }
+http-client = { path = "../http" }
 lastfm = { path = "../lastfm" }
 listenbrainz = { path = "../listenbrainz" }
 discord-ipc = { path = "../discord-ipc" }

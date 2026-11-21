@@ -411,6 +411,7 @@ export global Player {
     // Settings > Playback > Music from the server (server/streaming.rs): shown once there is a server
     // or a cache; the cap ("2 GB") and the space used ("340 MB used").
     in-out property <bool> stream-shown;
+    in-out property <string> stream-quality: "Original";
     in-out property <string> stream-cap: "2 GB";
     in-out property <string> stream-used;
 }
@@ -746,7 +747,7 @@ export global SettingsView {
     in-out property <bool> pin-side;
     in-out property <length> pin-height;
     in-out property <length> pin-cover;
-    // Home's "Connect Navidrome": Library's server sign-in is to be scrolled into view and its
+    // Home's "Connect a server": Library's server sign-in is to be scrolled into view and its
     // address focused (the card does it and clears this).
     in-out property <bool> focus-server;
 }
@@ -843,9 +844,17 @@ export global ListenBrainz {
     in-out property <bool> love;
 }
 
-// Settings > Library > Server: a Navidrome (Subsonic) server beside the folders (server/mod.rs).
+// Settings > Library > Server: a Plex or Subsonic server beside the folders (server/mod.rs).
 export global Server {
-    // The sign-in fields. The password is cleared as soon as Connect takes it.
+    // The masked field holds the Subsonic password or Plex access token until Connect.
+    in-out property <bool> plex;
+    in-out property <bool> plex-manual;
+    // Progress for browser sign-in and server selection. The model has display names only.
+    in-out property <string> plex-auth-status;
+    in-out property <[string]> plex-servers;
+    // Music sections of the connected Plex server. A negative index awaits a choice.
+    in-out property <[string]> plex-libraries;
+    in-out property <int> plex-library: -1;
     in-out property <string> address;
     in-out property <string> user;
     in-out property <string> password;
@@ -997,6 +1006,7 @@ export global Actions {
     callback crossfade-album-toggle();
     callback crossfade-skip-toggle();
     // Settings > Playback > Music from the server.
+    callback stream-quality-step(int);
     callback stream-cap-step(int);
     callback stream-clear();
     // Settings > Equalizer (eq.rs): on / off; a slider to a gain (dB); the preset menu
@@ -1140,7 +1150,7 @@ export global Actions {
 
     // Library folders.
     callback add-folder();
-    // Home's "Connect Navidrome": Settings > Library, the server's sign-in (server/mod.rs).
+    // Home's "Connect a server": Settings > Library, the server's sign-in (server/mod.rs).
     callback server-open-sign-in();
     callback remove-folder(int);
     callback rescan();
@@ -1150,6 +1160,10 @@ export global Actions {
     callback confirm-removal();
     // Settings > Library > Server (server/mod.rs).
     callback server-connect(string /* address */, string /* user */, string /* password */);
+    callback plex-sign-in();
+    callback plex-cancel();
+    callback plex-select-server(int /* index */);
+    callback plex-select-library(int /* index */);
     callback server-address-edited(string);
     callback server-sync();
     callback server-stop();

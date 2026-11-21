@@ -1,4 +1,4 @@
-//! A secret kept on disk (the server's token, `server/navidrome.rs`): on Linux and macOS, in a file only
+//! A secret kept on disk (the server's token, `server/account.rs`): on Linux and macOS, in a file only
 //! its user can read (mode 0600), as `~/.netrc` or an SSH key is; nothing sealed (there is no
 //! keyring every Linux desktop has, the AppImage's portable folder moves between machines, and
 //! the macOS Keychain asks the user again for every unsigned build). On a drive without

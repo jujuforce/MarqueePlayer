@@ -375,7 +375,8 @@ fn a_server_alone_is_a_library() {
         song_id: "j1-1-2".into(),
         suffix: Some("flac".into()),
         content_type: Some("audio/flac".into()),
-        size: 1_000_114
+        size: 1_000_114,
+        bitrate_kbps: Some(900),
     });
     assert_eq!(query::track_artists(&lib.conn, t.id).unwrap().iter().map(|a| (a.name.as_str(), a.featured)).collect::<Vec<_>>(), [
         ("Miles Example", false),

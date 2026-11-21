@@ -333,7 +333,7 @@ tokens); the tooltip's host without the scheme; the top right of Home (`activity
 the start-up scan, the sync after signing in, Sync now, a start's sync, one back from the tray, a
 rescan of the scanned library and a rescan with a sync right after it, each at least 700 ms,
 ending at full, one after the other without a gap. Then the folders are removed: an empty Home
-offers both sources, Connect Navidrome opens Settings > Library with the sign-in focused, and the
+offers both sources, Connect a server opens Settings > Library with the sign-in focused, and the
 first sync of an empty library (102 albums, the stand-in slowed) shows on Home in its large words,
 its albums coming in before it ends. `sv-*.png` and a count of failed checks at the end of
 `bench-server.txt`.

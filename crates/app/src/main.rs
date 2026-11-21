@@ -1092,6 +1092,18 @@ fn wire(app: &AppWindow) {
     a.on_server_connect(|url, user, password| {
         state::with(|st| server::connect(st, &url, &user, &password));
     });
+    a.on_plex_sign_in(|| {
+        state::with(server::browser::start);
+    });
+    a.on_plex_cancel(|| {
+        state::with(server::browser::cancel);
+    });
+    a.on_plex_select_server(|index| {
+        state::with(|st| server::browser::select(st, index));
+    });
+    a.on_plex_select_library(|index| {
+        state::with(|st| server::libraries::select(st, index));
+    });
     a.on_server_address_edited(|text| {
         state::with(|st| server::address_edited(st, &text));
     });
@@ -1221,6 +1233,9 @@ fn wire(app: &AppWindow) {
     a.on_crossfade_skip_toggle(|| crossfade_edit(|c| c.on_skip = !c.on_skip));
 
     // Settings > Playback > Music from the server (server/streaming.rs).
+    a.on_stream_quality_step(|d| {
+        state::with(|st| server::streaming::step_quality(st, d));
+    });
     a.on_stream_cap_step(|d| {
         state::with(|st| server::streaming::step_cap(st, d));
     });

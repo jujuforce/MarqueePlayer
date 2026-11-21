@@ -375,7 +375,7 @@ pub fn run() {
     stage!(100, until "signed in, the sync running", |_st, app| app.global::<Server>().get_signed_in() && app.global::<Server>().get_busy(), 15_000, |st, app, r| {
         let s = app.global::<Server>();
         check(r, "signed in", s.get_signed_in() && s.get_error().is_empty(), s.get_title().to_string());
-        let file = std::fs::read_to_string(crate::server::navidrome::path(&st.paths.data)).unwrap_or_default();
+        let file = std::fs::read_to_string(crate::server::account::path(&st.paths.data)).unwrap_or_default();
         check(r, "navidrome.json is kept, without the password", !file.is_empty() && !file.contains(PASSWORD) && !file.to_lowercase().contains("password"), format!("{} bytes", file.len()));
         #[cfg(windows)]
         {
@@ -658,8 +658,8 @@ pub fn run() {
             r,
             "scrobbling off for server tracks: a server track skipped, a local one scrobbled",
             !s.server_lastfm
-                && server_track.as_ref().is_some_and(|t| !crate::connections::scrobble::allowed(&s, t))
-                && local_track.as_ref().is_some_and(|t| crate::connections::scrobble::allowed(&s, t)),
+                && server_track.as_ref().is_some_and(|t| !crate::connections::scrobble::allowed(&s, t, &st.db))
+                && local_track.as_ref().is_some_and(|t| crate::connections::scrobble::allowed(&s, t, &st.db)),
             String::new(),
         );
         app.global::<Actions>().invoke_server_toggle(2);
@@ -787,7 +787,7 @@ pub fn run() {
         let s = app.global::<Server>();
         check(r, "a refused sign-in signs out and asks to sign in again", !s.get_signed_in() && s.get_attention() && s.get_leftover().contains("Sign in again"), s.get_leftover().to_string());
         check(r, "its music stays meanwhile", server::facts(&st.db).counts.server == 2, String::new());
-        check(r, "the stored sign-in is gone", !crate::server::navidrome::path(&st.paths.data).exists(), String::new());
+        check(r, "the stored sign-in is gone", !crate::server::account::path(&st.paths.data).exists(), String::new());
         snapshot(app, "sv-10-sign-in-again");
         with_mock(|m| m.set_trouble(Trouble::None));
         s.set_password(PASSWORD.into());
@@ -821,7 +821,7 @@ pub fn run() {
             let s = app.global::<Server>();
             let f = server::facts(&st.db);
             check(r, "signed out: the server's music gone, the folders' as it was", !s.get_signed_in() && f.counts.server == 0 && f.counts.both == 0 && !f.connected && f.counts.local == local_before.get(), format!("{f:?}"));
-            check(r, "the sign-in forgotten", !crate::server::navidrome::path(&st.paths.data).exists() && s.get_leftover().is_empty(), String::new());
+            check(r, "the sign-in forgotten", !crate::server::account::path(&st.paths.data).exists() && s.get_leftover().is_empty(), String::new());
             check(r, "and its fields empty: no address, user or password", s.get_address().is_empty() && s.get_user().is_empty() && s.get_password().is_empty(), format!("{:?} {:?}", s.get_address(), s.get_user()));
             check(r, "and what was agreed with it, and no play left for it", one(st, "SELECT COUNT(*) FROM remote_marks") == 0 && one(st, "SELECT COUNT(*) FROM remote_plays") == 0, String::new());
             let pill = app.global::<Nav>().get_flash().to_string();
@@ -846,7 +846,7 @@ pub fn run() {
     stage!(900, |_st, app, r| {
         let page = app.global::<Nav>().get_page();
         let v = app.global::<SettingsView>();
-        check(r, "Connect Navidrome opens Settings > Library", page == Page::Settings && v.get_section() as usize == settings::nav::LIBRARY, format!("{page:?}, section {}", v.get_section()));
+        check(r, "Connect a server opens Settings > Library", page == Page::Settings && v.get_section() as usize == settings::nav::LIBRARY, format!("{page:?}, section {}", v.get_section()));
         check(r, "and its sign-in took the request (in view, the address focused)", !v.get_focus_server(), String::new());
         snapshot(app, "sv-13-sign-in");
     });

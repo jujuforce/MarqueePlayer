@@ -1,18 +1,19 @@
 // Settings > Library, with the server.
 
 import { Theme } from "../../theme.slint";
-import { Library, Actions, LastFm, ListenBrainz, Server, SettingsView } from "../../stores.slint";
-import { Icon, Icons, IconButton, TextButton, LineField, SettingCard, SettingRow, SwitchRow, StatusNote, Hairline } from "../../widgets.slint";
+import { Library, Actions, LastFm, ListenBrainz, Server } from "../../stores.slint";
+import { Icon, Icons, IconButton, TextButton, SettingCard, SettingRow, SwitchRow, StatusNote, Hairline } from "../../widgets.slint";
 import { SectionHead, ServiceHead } from "parts.slint";
+import { ServerSignIn } from "server-signin.slint";
 
-// A Navidrome (or other Subsonic) server's music beside the folders, as one library (server/mod.rs).
+// A server's music beside the folders, as one library (server/mod.rs).
 component ServerSettings inherits VerticalLayout {
     spacing: 16px;
     VerticalLayout {
         padding-top: 12px;
         ServiceHead {
             title: "Server";
-            blurb: "Add the music on your Navidrome (or another Subsonic) server: it shows with your folders' music as one library, each album and track once. Its music files are never changed: only your favourites and plays go back to it, as the switches below say.";
+            blurb: "Browse and play music from a Plex, Navidrome or Subsonic server alongside your music folders.";
         }
     }
     if Server.held != "": StatusNote {
@@ -47,79 +48,29 @@ component ServerSettings inherits VerticalLayout {
             clicked => { Actions.server-sign-out(); }
         }
     }
-    if !Server.signed-in && !Server.busy: SettingCard {
-        title: "Sign in";
-        note: Server.leftover != "" ? Server.leftover : "The address you open the server at in a browser, and your user name and password there. The password is not kept: only a token made from it.";
-        VerticalLayout {
-            padding-left: 20px;
-            padding-right: 20px;
-            padding-top: 4px;
-            padding-bottom: 18px;
-            spacing: 10px;
-            // Home's "Connect Navidrome" asked for this card: in view, the address focused (once
-            // the page is laid out).
-            Timer {
-                interval: 60ms;
-                running: SettingsView.focus-server;
-                triggered => {
-                    SettingsView.focus-server = false;
-                    Actions.reveal(root.absolute-position.y, root.height);
-                    address.focus-field();
-                }
-            }
-            address := LineField {
-                text <=> Server.address;
-                placeholder: "Address, such as https://music.example.org or http://192.168.1.10:4533";
-                label: "Server address";
-                edited(t) => { Actions.server-address-edited(t); }
-                accepted => { Actions.server-connect(Server.address, Server.user, Server.password); }
-            }
-            LineField {
-                text <=> Server.user;
-                placeholder: "User name";
-                label: "User name on the server";
-                accepted => { Actions.server-connect(Server.address, Server.user, Server.password); }
-            }
-            LineField {
-                text <=> Server.password;
-                placeholder: "Password";
-                label: "Password on the server";
-                input-type: InputType.password;
-                accepted => { Actions.server-connect(Server.address, Server.user, Server.password); }
-            }
-            if Server.plain-http: Text {
-                text: "Plain http: the connection is not encrypted, so the sign-in and the music can be read on the way. Fine on your own network; use https for a server reached over the internet.";
+    if Server.signed-in && Server.plex && Server.plex-libraries.length > 0: SettingCard {
+        title: "Music library";
+        note: Server.plex-library < 0 ? "Choose the Plex library to sync with Marquee Player." : "";
+        for name[i] in Server.plex-libraries: SettingRow {
+            label: name;
+            divider: i > 0;
+            if i == Server.plex-library: Text {
+                text: "Selected";
+                accessible-label: name + " is the selected music library";
                 font-size: Theme.font-small;
-                color: Theme.text-faint;
-                wrap: word-wrap;
+                color: Theme.text-dim;
             }
-            if Server.error != "": Text {
-                text: Server.error;
-                font-size: Theme.font-small;
-                color: Theme.text;
-                wrap: word-wrap;
-            }
-            HorizontalLayout {
-                alignment: start;
-                padding-top: 4px;
-                spacing: 8px;
-                TextButton {
-                    text: Server.signing-in ? "Connecting\u{2026}" : "Connect";
-                    primary: !Server.signing-in && Server.address != "" && Server.user != "" && Server.password != "";
-                    label: "Sign in to the server";
-                    clicked => { Actions.server-connect(Server.address, Server.user, Server.password); }
-                }
-                if Server.leftover != "": TextButton {
-                    text: "Remove its music";
-                    label: "Remove the server's music from the library; your folders' music stays as it is";
-                    clicked => { Actions.server-sign-out(); }
-                }
+            if i != Server.plex-library && !Server.busy: TextButton {
+                text: "Use library";
+                label: "Use the Plex music library " + name;
+                clicked => { Actions.plex-select-library(i); }
             }
         }
     }
+    if !Server.signed-in && !Server.busy: ServerSignIn { }
     // What goes back to the server (server/write.rs): its own database only, never a file.
     SettingCard {
-        SwitchRow {
+        if !Server.plex: SwitchRow {
             divider: false;
             label: "Sync favourites with the server";
             hint: "Both ways, for the tracks the server has: a heart changed here goes to the server at once, and one changed there comes here at the next sync.";
@@ -127,7 +78,7 @@ component ServerSettings inherits VerticalLayout {
             checked: Server.sync-marks;
             toggled => { Actions.server-toggle(0); }
         }
-        SwitchRow {
+        if !Server.plex: SwitchRow {
             label: "Report plays to the server";
             hint: "Each play counted here of a track the server has goes to its play counts and history, and it shows as playing there. If the server itself scrobbles to Last.fm or ListenBrainz, turn off the next switch, or those plays get there twice.";
             more: "A play made while the server cannot be reached waits and goes at the next sync. Off: plays not yet sent are forgotten, and none goes later.";
@@ -135,10 +86,12 @@ component ServerSettings inherits VerticalLayout {
             toggled => { Actions.server-toggle(1); }
         }
         SwitchRow {
+            divider: !Server.plex;
             label: "Scrobble server tracks from this app";
             enabled: LastFm.connected || ListenBrainz.connected;
             hint: LastFm.connected || ListenBrainz.connected
-                ? "To Last.fm and ListenBrainz. Off: this app tells them nothing of the tracks it plays from the server (nor, while plays are reported to the server, of your files the server also has), so a server that scrobbles them itself does not make them count twice."
+                ? (Server.plex ? "Send plays of streamed Plex tracks to your connected scrobbling services."
+                    : "To Last.fm and ListenBrainz. Off: this app tells them nothing of the tracks it plays from the server (nor, while plays are reported to the server, of your files the server also has), so a server that scrobbles them itself does not make them count twice.")
                 : "Neither Last.fm nor ListenBrainz is connected in this app (Settings > Connections), so there is nothing to scrobble twice.";
             checked: Server.lastfm-scrobbles;
             toggled => { Actions.server-toggle(2); }

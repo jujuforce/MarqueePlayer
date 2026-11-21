@@ -175,8 +175,8 @@ pub fn scrobble_of(t: &Track, started: i64) -> Scrobble {
 /// server also has: the server hears of that play too, and one that scrobbles itself (to
 /// Last.fm or ListenBrainz) would send it again. A track the server does not have is always
 /// scrobbled.
-pub fn allowed(s: &crate::settings::Settings, t: &Track) -> bool {
-    s.server_lastfm || !(t.is_remote() || (t.remote_id.is_some() && s.server_plays))
+pub fn allowed(s: &crate::settings::Settings, t: &Track, db: &rusqlite::Connection) -> bool {
+    s.server_lastfm || !(t.is_remote() || (t.remote_id.is_some() && crate::server::write::reports_plays(s, db).unwrap_or(s.server_plays)))
 }
 
 /// A track started: "now playing" to each service connected, and the play that may count
@@ -399,8 +399,10 @@ mod tests {
         let server_only = track("From the server", &library::remote::song_path("s1"), Some("s1"));
         let matched = track("File the server has", "M:/a/02.flac", Some("s2"));
         let local = track("Only here", "M:/a/01.flac", None);
+        let db = library::db::open_in_memory().unwrap();
+        db.execute("INSERT INTO remote_server (id, identity, connected_at) VALUES (1, 'https://nas (ann)', 0)", []).unwrap();
         let play = |s: &crate::settings::Settings, t: &Track| {
-            if let Some(p) = track_started(t, allowed(s, t), None) {
+            if let Some(p) = track_started(t, allowed(s, t, &db), None) {
                 scrobble(p);
             }
         };
@@ -431,7 +433,11 @@ mod tests {
         assert_eq!(lb.with(|s| s.requests.len()), 2, "ListenBrainz: one now playing and one listen");
         // Plays not reported to the server: the file the server has is the app's to scrobble.
         let not_reported = crate::settings::Settings { server_plays: false, ..off.clone() };
-        assert!(!allowed(&not_reported, &server_only) && allowed(&not_reported, &matched) && allowed(&not_reported, &local));
+        assert!(!allowed(&not_reported, &server_only, &db) && allowed(&not_reported, &matched, &db) && allowed(&not_reported, &local, &db));
+        // Plex never receives plays. A matched file plays locally and can still scrobble.
+        db.execute("UPDATE remote_server SET identity = 'plex:abc'", []).unwrap();
+        assert!(allowed(&off, &matched, &db));
+        assert!(!allowed(&off, &server_only, &db));
         // On (the default): every track, as before.
         let on = crate::settings::Settings::default();
         play(&on, &server_only);

@@ -1,0 +1,234 @@
+// The Server sign-in card in Settings > Library.
+
+import { Theme } from "../../theme.slint";
+import { Actions, Server, SettingsView } from "../../stores.slint";
+import { FocusRing, Icons, LineField, Segmented, SettingCard, SettingRow, TextButton } from "../../widgets.slint";
+
+// A single keyboard stop for the two Plex methods. Arrows select a panel without
+// starting sign-in, just as clicking its tab does.
+component PlexMethodTabs inherits FocusScope {
+    callback choose-manual(bool);
+    private property <[string]> methods: ["Sign in with Plex", "Connect manually"];
+    height: 34px;
+    focus-on-click: false;
+    accessible-role: tab-list;
+    accessible-label: "Plex connection method";
+    accessible-value: root.methods[Server.plex-manual ? 1 : 0];
+    accessible-enabled: root.enabled;
+    focus-gained(reason) => {
+        if reason == FocusReason.tab-navigation { Actions.reveal(root.absolute-position.y, root.height); }
+    }
+    key-pressed(ev) => {
+        if ev.modifiers.control || ev.modifiers.alt || ev.modifiers.shift { return reject; }
+        if ev.text == Key.LeftArrow || ev.text == Key.Home { root.choose-manual(false); return accept; }
+        if ev.text == Key.RightArrow || ev.text == Key.End { root.choose-manual(true); return accept; }
+        reject
+    }
+    Rectangle { y: parent.height - 1px; width: 100%; height: 1px; background: Theme.border; }
+    HorizontalLayout {
+        alignment: start;
+        spacing: 8px;
+        for name[i] in root.methods: Rectangle {
+            property <bool> selected: (i == 1) == Server.plex-manual;
+            width: caption.preferred-width + 16px;
+            background: hit.has-hover ? Theme.hover : transparent;
+            accessible-role: tab;
+            accessible-label: name;
+            accessible-item-selectable: true;
+            accessible-item-selected: self.selected;
+            accessible-item-index: i;
+            accessible-item-count: root.methods.length;
+            accessible-enabled: root.enabled;
+            accessible-action-default => { if root.enabled { root.choose-manual(i == 1); } }
+            caption := Text {
+                text: name;
+                font-size: Theme.font-small;
+                font-weight: parent.selected ? 700 : 500;
+                color: parent.selected ? Theme.text : Theme.text-dim;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                accessible-role: none;
+            }
+            if self.selected: Rectangle { y: parent.height - 2px; width: 100%; height: 2px; background: Theme.accent; }
+            hit := TouchArea {
+                enabled: root.enabled;
+                mouse-cursor: pointer;
+                clicked => { root.choose-manual(i == 1); }
+            }
+            FocusRing { shown: root.has-focus && parent.selected; radius: Theme.radius-control; inset: true; }
+        }
+    }
+}
+
+component CredentialsForm inherits VerticalLayout {
+    callback reveal();
+
+    function connect() { Actions.server-connect(Server.address, Server.user, Server.password); }
+
+    spacing: 10px;
+    Timer {
+        interval: 60ms;
+        running: SettingsView.focus-server;
+        triggered => { root.reveal(); address.focus-field(); }
+    }
+    address := LineField {
+        text <=> Server.address;
+        placeholder: Server.plex ? "Server address, such as http://192.168.1.10:32400" : "Address, such as https://music.example.org or http://192.168.1.10:4533";
+        label: "Server address";
+        edited(t) => { Actions.server-address-edited(t); }
+        accepted => { root.connect(); }
+    }
+    if !Server.plex: LineField {
+        text <=> Server.user;
+        placeholder: "User name";
+        label: "User name on the server";
+        accepted => { root.connect(); }
+    }
+    LineField {
+        text <=> Server.password;
+        placeholder: Server.plex ? "Plex access token" : "Password";
+        label: Server.plex ? "Plex access token" : "Password on the server";
+        input-type: InputType.password;
+        accepted => { root.connect(); }
+    }
+    if Server.plain-http: Text {
+        text: "Plain http: the connection is not encrypted, so the sign-in and the music can be read on the way. Fine on your own network; use https for a server reached over the internet.";
+        font-size: Theme.font-small;
+        color: Theme.text-faint;
+        wrap: word-wrap;
+    }
+    HorizontalLayout {
+        alignment: start;
+        spacing: 8px;
+        TextButton {
+            text: Server.signing-in ? "Connecting\u{2026}" : "Connect";
+            primary: !Server.signing-in && Server.address != "" && (Server.plex || Server.user != "") && Server.password != "";
+            label: "Sign in to the server";
+            clicked => { root.connect(); }
+        }
+    }
+}
+
+export component ServerSignIn inherits SettingCard {
+    private property <bool> browser: Server.plex && !Server.plex-manual;
+    private property <bool> authorising: Server.plex-auth-status != "" || Server.plex-servers.length > 0;
+
+    title: "Sign in";
+    note: Server.leftover != "" ? Server.leftover : Server.plex ? "" : "Use the address, user name and password for your Navidrome or Subsonic server.";
+
+    function reveal() {
+        SettingsView.focus-server = false;
+        Actions.reveal(root.absolute-position.y, root.height);
+    }
+
+    function change-provider(plex: bool) {
+        if plex != Server.plex && (!Server.signing-in || root.authorising) {
+            if root.authorising { Actions.plex-cancel(); }
+            Server.plex = plex;
+            Server.plex-manual = false;
+            Server.address = "";
+            Server.user = "";
+            Server.password = "";
+            Server.plain-http = false;
+            Server.error = "";
+        }
+    }
+
+    function change-method(manual: bool) {
+        if manual != Server.plex-manual && (!Server.signing-in || root.authorising) {
+            if root.authorising { Actions.plex-cancel(); }
+            Server.plex-manual = manual;
+            Server.password = "";
+            Server.error = "";
+        }
+    }
+
+    VerticalLayout {
+        padding-left: 20px;
+        padding-right: 20px;
+        padding-top: 4px;
+        padding-bottom: 18px;
+        spacing: 10px;
+        HorizontalLayout {
+            alignment: start;
+            Segmented {
+                label: "Server type";
+                options: ["Navidrome / Subsonic", "Plex"];
+                selected: Server.plex ? 1 : 0;
+                chosen(i) => { root.change-provider(i == 1); }
+            }
+        }
+        if !Server.plex: CredentialsForm { reveal => { root.reveal(); } }
+        if Server.plex: PlexMethodTabs {
+            enabled: !Server.signing-in || root.authorising;
+            choose-manual(manual) => { root.change-method(manual); }
+        }
+        if Server.plex: VerticalLayout {
+            accessible-role: tab-panel;
+            accessible-label: Server.plex-manual ? "Connect manually" : "Sign in with Plex";
+            spacing: 10px;
+            if !root.authorising: Text {
+                text: Server.plex-manual
+                    ? "In Plex Web, open Get Info on a track, choose View XML and copy the X-Plex-Token value from the URL."
+                    : "Authorize Marquee Player in your browser to find your Plex servers.";
+                font-size: Theme.font-small;
+                color: Theme.text-faint;
+                wrap: word-wrap;
+            }
+            if Server.plex-manual: CredentialsForm { reveal => { root.reveal(); } }
+            if root.browser: VerticalLayout {
+                spacing: 10px;
+                Timer {
+                    interval: 60ms;
+                    running: SettingsView.focus-server;
+                    triggered => { root.reveal(); browser-action.focus-button(); }
+                }
+                if root.authorising: Text {
+                    text: Server.plex-servers.length > 0 ? "Choose a Plex server" : Server.plex-auth-status;
+                    accessible-role: text;
+                    accessible-live-region: AccessibleLiveness.polite;
+                    font-size: Theme.font-body;
+                    color: Theme.text;
+                    wrap: word-wrap;
+                }
+                HorizontalLayout {
+                    alignment: start;
+                    spacing: 8px;
+                    browser-action := TextButton {
+                        text: root.authorising ? "Cancel" : "Continue in browser";
+                        label: root.authorising ? "Cancel Plex sign-in" : "Continue in browser";
+                        primary: !root.authorising;
+                        clicked => { if root.authorising { Actions.plex-cancel(); } else { Actions.plex-sign-in(); } }
+                    }
+                }
+            }
+        }
+        if Server.error != "": Text {
+            text: Server.error;
+            accessible-role: text;
+            accessible-live-region: AccessibleLiveness.polite;
+            font-size: Theme.font-small;
+            color: Theme.text;
+            wrap: word-wrap;
+        }
+        if Server.leftover != "": HorizontalLayout {
+            alignment: start;
+            TextButton {
+                text: "Remove its music";
+                label: "Remove the server's music from the library";
+                clicked => { Actions.server-sign-out(); }
+            }
+        }
+    }
+    if root.browser && Server.plex-servers.length > 0: VerticalLayout {
+        for name[i] in Server.plex-servers: SettingRow {
+            label: name;
+            TextButton {
+                text: "Connect";
+                glyph: Icons.cloud;
+                label: "Connect to " + name;
+                clicked => { Actions.plex-select-server(i); }
+            }
+        }
+    }
+}
