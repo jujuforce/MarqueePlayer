@@ -156,6 +156,15 @@ audio progress, spectrum updates, process CPU and memory. Compositor interpolati
 produce additional display frames between spectrum updates. Use an OS window recording
 when measuring the animation as displayed.
 
+To isolate the renderer on macOS, build once in release mode with the `bench` feature.
+Make two copies of the same saved profile before launching either. Run `viz-idle` once
+with `SLINT_BACKEND=winit-skia` and once with `SLINT_BACKEND=winit-software`.
+Set `MP_BENCH_SAVED_QUEUE=1`, `MP_BENCH_VIZ_SECS=32`, and point `MP_DATA_DIR` and
+`MP_BENCH_OUT` at the corresponding copy for each run. Check the window-surface log
+and the audio-progress check in `bench-viz-idle.txt`. For Ring → Ripples, repeat at
+Full and Half. When testing the Panel placement interactively, select its Visualizer
+tab before measuring.
+
 To repeat the check in a production build, start a fresh instance with
 `--resume-playback`. It opens Now Playing and plays the restored queue at its
 saved position. Audio files passed on the command line take precedence.

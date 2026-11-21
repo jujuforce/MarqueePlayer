@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
 import { Page, AlbumCard, TrackRow, ShelfView, ShelfLayout, QueueRow, PlaylistRow, NamedCount, ShelfEdit } from "types.slint";
-import { Nav, Home, Grid, AlbumPage, ArtistPage, Search, Playlists, Player, Queue, Library, ShelfEditor, Backdrop, Actions } from "stores.slint";
+import { StageBounds, ProgressPaint, Nav, Home, Grid, AlbumPage, ArtistPage, Search, Playlists, Player, Queue, Library, ShelfEditor, Backdrop, Actions } from "stores.slint";
 import { HomePage } from "pages/home.slint";
 import { AlbumsPage, ShelfAllPage, ArtistsPage, GroupsPage, TracksPage } from "pages/browse.slint";
 import { AlbumPageView } from "pages/album.slint";
@@ -10,7 +10,7 @@ import { PlaylistsPage, PlaylistPage } from "pages/playlists.slint";
 import { NowPlayingPage } from "pages/nowplaying.slint";
 import { SettingsPage } from "pages/settings/settings.slint";
 import { ShelvesPage } from "pages/shelves.slint";
-import { Sidebar, PlayerBar, QueueSidebar, NavPill, CaptionButtons } from "chrome.slint";
+import { Sidebar, PlayerBar, ElapsedText, QueueSidebar, NavPill, CaptionButtons } from "chrome.slint";
 import { AppMenu } from "menu.slint";
 import { NamePrompt, ClashPrompt } from "dialogs.slint";
 import { MetadataPanel } from "metaview.slint";
@@ -25,6 +25,23 @@ export { Theme, Nav, Home, Grid, AlbumPage, ArtistPage, Search, Playlists, Playe
 export { Page, AlbumCard, TrackRow, ShelfView, ShelfLayout, QueueRow, PlaylistRow, NamedCount, ShelfEdit }
 export { Activity, MenuStore, Chrome, ShelfPage, Focus, Keys, Browse, TrackPage, Output, LastFm, ListenBrainz, Server, Discord, Lyrics, Visualizer, SettingsView, Autoscroll, Dialog, Meta, AboutView, SmartList, SmartEdit, Picker, Equalizer, EqPreview, PlatformWords }
 export { MenuItemData, KeyHelp, KeyRow, LyricLine, SettingHit, MetaRow, AboutFile, AboutCredit, SmartRow, SmartSlot, EqBandRow, EqNote, VizPresetRow } from "types.slint";
+
+// Never shown: taking a snapshot uses the Skia CPU surface, with the same glyph
+// rasterization as the main window. Only the changing elapsed label is rasterized.
+export component ClockStamp inherits Window {
+    in property <string> elapsed;
+    in property <string> family;
+    in property <length> type-size;
+    in property <color> ink;
+    background: transparent;
+    ElapsedText {
+        width: 100%; height: 100%;
+        text: root.elapsed;
+        font-family: root.family;
+        font-size: root.type-size;
+        color: root.ink;
+    }
+}
 
 export component AppWindow inherits Window {
     title: "Marquee Player";
@@ -75,6 +92,37 @@ export component AppWindow inherits Window {
     // Whether the player bar is up (for the bench).
     out property <bool> bar-visible: Player.bar-up;
     out property <length> seek-width: player-bar.seek-width;
+    // The normal Slint widgets own all input and accessibility. Custom fonts and unsettled
+    // layouts also use their normal paint, so hover, focus, overlays and transitions match.
+    private property <bool> native-progress: Visualizer.metal-surface && root.window-shown && !root.minimized
+        && root.chrome-at-rest && root.no-modal && root.menu-clears-bar && !root.transitioning
+        && Player.bar-up && Player.playing && player-bar.steady-seek
+        && Theme.font-family == "System Font";
+    private property <ProgressPaint> progress-paint: root.native-progress ? player-bar.progress-paint : {};
+    private property <bool> presented-progress;
+    callback paint-progress(ProgressPaint) -> bool;
+    changed progress-paint => { root.presented-progress = root.paint-progress(root.progress-paint); }
+    // Native glass follows stationary chrome. A sliding panel or overlay must sample the
+    // complete foreground and spectrum together until the chrome reaches its resting place.
+    private property <bool> chrome-at-rest: left-sidebar.settled && right-sidebar.settled
+        && bar-area.y == (Player.bar-up ? self.height - bar-area.height : self.height)
+        && content.x == (Nav.sidebar-pinned ? Theme.sidebar-width : 0px)
+        && content.width == self.width - content.x - (Nav.queue-pinned ? Theme.queue-width : 0px);
+    private property <bool> no-modal: !Dialog.open && !Picker.open && !Autoscroll.on;
+    private property <bool> menu-laid-out: Visualizer.metal-surface
+        && MenuStore.main-frame.width > 0px && MenuStore.main-frame.height > 0px
+        && (MenuStore.sub-of < 0 || (MenuStore.sub-frame.width > 0px && MenuStore.sub-frame.height > 0px));
+    // Menu shadows have a 24px blur and 6px downward offset. Leave room for the blurred fringe.
+    private property <bool> menu-clears-bar: !MenuStore.open || (root.menu-laid-out
+        && MenuStore.main-frame.y + MenuStore.main-frame.height + 48px < bar-area.y
+        && (MenuStore.sub-of < 0 || MenuStore.sub-frame.y + MenuStore.sub-frame.height + 48px < bar-area.y));
+    // Paused or buffering playback can stop the visualizer timer between menu layout changes.
+    out property <bool> viz-fixed-glass: root.chrome-at-rest && root.no-modal && Player.playing && !Player.buffering
+        && (!MenuStore.open || root.menu-laid-out);
+    changed viz-fixed-glass => {
+        if !self.viz-fixed-glass && Visualizer.native-underlay && Theme.glass { Actions.visualizer-wake(); }
+    }
+    out property <StageBounds> viz-pill-frame: { x: nav-pill.x, y: nav-pill.y, width: nav-pill.width, height: nav-pill.height };
     // Where the player bar and the caption buttons are, and what the bar needs (for the
     // interface size bench: everything inside the window at every size).
     out property <length> bar-top: bar-area.y;
@@ -238,7 +286,7 @@ export component AppWindow inherits Window {
             }
         }
 
-        NavPill {
+        nav-pill := NavPill {
             // Clear of the system's caption buttons where they are over the page (macOS).
             x: max(content.x + 12px, Chrome.caption-inset);
             y: 14px;
@@ -259,13 +307,13 @@ export component AppWindow inherits Window {
             }
         }
 
-        QueueSidebar {
+        right-sidebar := QueueSidebar {
             y: 0;
             window-width: root.width;
             window-height: root.height;
         }
 
-        Sidebar { x: 0; y: 0; window-height: root.height; }
+        left-sidebar := Sidebar { x: 0; y: 0; window-height: root.height; }
 
         // With auto-hide, the bar's place at the bottom: the pointer reaching it brings the
         // bar back. Under the bar, so it only sees the pointer while the bar is away. It
@@ -282,7 +330,7 @@ export component AppWindow inherits Window {
             height: Theme.bar-height;
             animate y { duration: Theme.dur-sidebar; easing: ease-out; }
             AutoscrollBlock { }
-            player-bar := PlayerBar { }
+            player-bar := PlayerBar { paint-progress-externally: root.native-progress && root.presented-progress; }
         }
 
         caption := CaptionButtons {

@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
 import { Page } from "types.slint";
-import { Nav, Player, Queue, Playlists, Backdrop, Actions, Chrome, Library, Server, Focus, Keys, Equalizer } from "stores.slint";
+import { Nav, Player, Queue, Playlists, Backdrop, Actions, Chrome, Library, Server, Focus, Keys, Equalizer, Visualizer, ProgressPaint } from "stores.slint";
 import { Icon, Icons, IconButton, Cover, Slider, ArtistLinks, LinkText, FocusRing, FocusTarget } from "widgets.slint";
 import { QueueList } from "lists.slint";
 import { AutoFlickable, AutoscrollBlock } from "autoscroll.slint";
@@ -78,6 +78,8 @@ export component Sidebar inherits Rectangle {
     in property <length> window-height;
     // Open while the keyboard focus is in it too, so Tab never lands on a hidden item.
     out property <bool> open: Nav.sidebar-pinned || Nav.sidebar-forced || Nav.sidebar-hover-open || Focus.zone == "sidebar";
+    out property <bool> settled: (Nav.sidebar-pinned ? panel.x == 0px : !root.open && !panel.visible)
+        && root.bar-room == (Player.bar-up ? Theme.bar-height : 0px);
     private property <bool> hovering: edge.has-hover || panel.has-hover || edge-drop.has-drag || Focus.drop-playlist >= 0 || playlists.autoscrolling || drop-new.has-drag;
     changed hovering => {
         if self.hovering { Nav.sidebar-hover-open = true; }
@@ -125,10 +127,16 @@ export component Sidebar inherits Rectangle {
         height: root.height - root.bar-room;
         // A middle press on the panel leaves the page under it alone.
         AutoscrollBlock { }
+        if Visualizer.native-underlay && Nav.sidebar-pinned && Theme.glass: Rectangle {
+            width: min(parent.width, 3 * Theme.glass-radius-blur + 2px);
+            x: parent.width - self.width;
+            height: parent.height;
+            backdrop-blur: Theme.glass-radius-blur;
+        }
         Rectangle {
             // Frosted glass: blurs the page scrolling behind it (Skia), tinted.
             background: Theme.glass-fill;
-            backdrop-blur: Theme.glass-radius-blur;
+            backdrop-blur: Visualizer.native-underlay && Nav.sidebar-pinned ? 0px : Theme.glass-radius-blur;
             border-width: 1px;
             border-color: Theme.border;
             drop-shadow-blur: Nav.sidebar-pinned ? 0px : 28px;
@@ -148,6 +156,7 @@ export component Sidebar inherits Rectangle {
                 }
             }
             VerticalLayout {
+                cache-rendering-hint: Visualizer.cache-controls;
                 padding: 14px;
                 spacing: 4px;
                 HorizontalLayout {
@@ -295,10 +304,23 @@ export component Sidebar inherits Rectangle {
     }
 }
 
+// Shared with the small offscreen clock that paints the same text on macOS.
+export component ElapsedText inherits Text {
+    horizontal-alignment: right;
+    vertical-alignment: center;
+}
+
 // Always-visible transport at the bottom, over the blurred art.
 export component PlayerBar inherits Rectangle {
     height: Theme.bar-height;
     out property <length> seek-width: seek.width;
+    in property <bool> paint-progress-externally;
+    out property <bool> steady-seek: seek.resting && seek.enabled;
+    out property <ProgressPaint> progress-paint: {
+        fill: seek.fill-frame,
+        clock: { x: elapsed.absolute-position.x, y: elapsed.absolute-position.y, width: elapsed.width, height: elapsed.height },
+        elapsed: Player.position-text, family: Theme.font-family, font-size: elapsed.font-size, ink: Theme.text, dim: Theme.text-dim,
+    };
     // The seek or volume slider is being dragged (or has not caught up with its release).
     out property <bool> dragging: seek.active || volume.active;
     // With glass, the bar blurs the page scrolling under it. Without (glass-blur = 0 or
@@ -320,6 +342,7 @@ export component PlayerBar inherits Rectangle {
     }
     Rectangle { y: 0; height: 1px; background: Theme.border; }
     HorizontalLayout {
+        cache-rendering-hint: Visualizer.cache-controls;
         padding-left: 18px;
         padding-right: 18px;
         spacing: 18px;
@@ -416,17 +439,19 @@ export component PlayerBar inherits Rectangle {
             }
             HorizontalLayout {
                 spacing: 10px;
-                Text {
+                elapsed := ElapsedText {
                     width: 44px;
                     // While dragging and until the seek lands: the target, not the old position.
-                    text: seek.active ? floor(seek.shown-value * Player.duration / 60) + ":" + (mod(floor(seek.shown-value * Player.duration), 60) < 10 ? "0" : "") + mod(floor(seek.shown-value * Player.duration), 60) : Player.position-text;
-                    horizontal-alignment: right;
-                    vertical-alignment: center;
+                    private property <string> shown-time: seek.active ? floor(seek.shown-value * Player.duration / 60) + ":" + (mod(floor(seek.shown-value * Player.duration), 60) < 10 ? "0" : "") + mod(floor(seek.shown-value * Player.duration), 60) : Player.position-text;
+                    // Keep the same line metrics and accessibility while Core Animation paints it.
+                    text: root.paint-progress-externally ? "0:00" : self.shown-time;
+                    accessible-label: self.shown-time;
                     font-size: Theme.font-small;
-                    color: Theme.text-dim;
+                    color: root.paint-progress-externally ? transparent : Theme.text-dim;
                 }
                 // Live scrub: audio follows the thumb while dragging (throttled in Rust).
                 seek := Slider {
+                    external-fill: root.paint-progress-externally;
                     enabled: Player.has-track && Player.duration > 0;
                     value: Player.duration > 0 ? Player.position / Player.duration : 0;
                     // Arrived when within 0.4 s of the target.
@@ -532,6 +557,8 @@ export component QueueSidebar inherits Rectangle {
     in property <length> window-height;
     // Open while the keyboard focus is in it too, so Tab never lands on a hidden row.
     out property <bool> open: Nav.queue-pinned || Nav.queue-open || Nav.queue-hover-open || Focus.zone == "queue";
+    out property <bool> settled: (Nav.queue-pinned ? panel.x == root.width - Theme.queue-width : !root.open && !panel.visible)
+        && root.bar-room == (Player.bar-up ? Theme.bar-height : 0px);
     private property <bool> hovering: edge.has-hover || panel.has-hover || edge-drop.has-drag || list.dragging-over || list.autoscrolling;
     changed hovering => {
         if self.hovering { Nav.queue-hover-open = true; }
@@ -584,14 +611,22 @@ export component QueueSidebar inherits Rectangle {
         width: Theme.queue-width;
         height: root.height;
         AutoscrollBlock { }
+        if Visualizer.native-underlay && Nav.queue-pinned && Theme.glass: Rectangle {
+            // Only the page-facing edge of a pinned sidebar can sample foreground
+            // artwork. The underlay supplies the blur of the live backdrop everywhere.
+            width: min(parent.width, 3 * Theme.glass-radius-blur + 2px);
+            height: parent.height;
+            backdrop-blur: Theme.glass-radius-blur;
+        }
         Rectangle {
             background: Theme.glass-fill;
-            backdrop-blur: Theme.glass-radius-blur;
+            backdrop-blur: Visualizer.native-underlay && Nav.queue-pinned ? 0px : Theme.glass-radius-blur;
             border-width: 1px;
             border-color: Theme.border;
             drop-shadow-blur: Nav.queue-pinned ? 0px : 28px;
             drop-shadow-color: #00000070;
             VerticalLayout {
+                cache-rendering-hint: Visualizer.cache-controls;
                 padding: 14px;
                 // Clear of the caption buttons above the header.
                 padding-top: Theme.caption-height + 4px;
@@ -682,6 +717,7 @@ export component NavPill inherits Rectangle {
     TouchArea { }
     AutoscrollBlock { layer: 1; }
     row := HorizontalLayout {
+        cache-rendering-hint: Visualizer.cache-controls;
         padding-left: 4px;
         padding-right: 14px;
         spacing: 0px;

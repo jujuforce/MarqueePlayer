@@ -5,7 +5,8 @@
 //! runs a tick on the UI thread for each one (`forward`). The timer is only for what
 //! moves by itself, and runs no more often than that needs:
 //!
-//! - playing, window shown: 100 to 500 ms per seek-bar pixel, or 100 ms for visible synced lyrics;
+//! - playing, window shown: every 100 ms. On macOS the seek bar can tick once per pixel
+//!   (up to 500 ms), with the full rate for visible synced lyrics;
 //! - playing, window hidden, minimized or covered: every 500 ms (play counting, session saves);
 //! - not playing, window shown: once a second (window placement, saves);
 //! - not playing, hidden: not at all.
@@ -143,6 +144,9 @@ fn rate(settling: bool, playing: bool, shown: bool, visible_cadence: impl FnOnce
 }
 
 fn visible_cadence(app: &AppWindow) -> Duration {
+    if !cfg!(target_os = "macos") {
+        return FAST;
+    }
     let lyrics = app.global::<Lyrics>();
     if app.global::<Nav>().get_page() == Page::NowPlaying && lyrics.get_shown() && lyrics.get_synced() {
         FAST

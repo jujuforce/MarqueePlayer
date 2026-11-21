@@ -11,7 +11,7 @@ fn main() {
     println!("cargo:rustc-env=APP_VERSION={}", version.text);
 
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
-        let sources = ["src/platform/macos/artwork.m", "src/platform/macos/spectrum.m", "src/platform/macos/particles.m"];
+        let sources = ["src/platform/macos/artwork.m", "src/platform/macos/spectrum.m", "src/platform/macos/particles.m", "src/platform/macos/transport.m"];
         let mut build = cc::Build::new();
         if std::env::var_os("CARGO_FEATURE_BENCH").is_some() {
             build.define("MP_BENCH", None);
@@ -22,6 +22,8 @@ fn main() {
         }
         println!("cargo:rustc-link-lib=framework=MediaPlayer");
         println!("cargo:rustc-link-lib=framework=QuartzCore");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=CoreImage");
         println!("cargo:rerun-if-changed=src/platform/macos/particles.h");
     }
     let msvc = std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc");

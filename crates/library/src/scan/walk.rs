@@ -24,7 +24,7 @@
 //! the walk was on its way to it is gone.
 
 use std::collections::HashMap;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -212,7 +212,7 @@ impl<'a> Walk<'a> {
                 }
                 *self.counts.entry(dir_key(&path)).or_default() += 1;
                 subdirs.push(path);
-            } else if meta.is_file() && is_audio(&path) {
+            } else if meta.is_file() && is_audio(&path) && !is_appledouble(&path) {
                 files.push(file_info(path, &meta));
             }
         }
@@ -273,6 +273,15 @@ fn leads_back(path: &Path, ancestors: &mut [Ancestor]) -> std::io::Result<bool> 
     }))
 }
 
+/// Finder's metadata sidecars share the track's extension. A real track can also start with `._`.
+fn is_appledouble(path: &Path) -> bool {
+    if !path.file_name().is_some_and(|name| name.as_encoded_bytes().starts_with(b"._")) {
+        return false;
+    }
+    let mut magic = [0; 4];
+    std::fs::File::open(path).and_then(|mut file| file.read_exact(&mut magic)).is_ok() && u32::from_be_bytes(magic) == 0x0005_1607
+}
+
 fn file_info(path: PathBuf, meta: &std::fs::Metadata) -> FileInfo {
     let mtime = meta.modified().ok().and_then(|t| t.duration_since(UNIX_EPOCH).ok());
     // The earliest the file is known to have been here: its creation, or its last change when
@@ -311,6 +320,19 @@ mod tests {
                 (key, u.files.iter().map(|f| rel(&f.path)).collect())
             })
             .collect()
+    }
+
+    #[test]
+    fn only_appledouble_sidecars_are_skipped() {
+        let root = crate::testdir::TestDir::new("walk-appledouble");
+        std::fs::write(root.join("song.flac"), b"fLaC").unwrap();
+        std::fs::write(root.join("._song.flac"), b"\x00\x05\x16\x07\x00\x02\x00\x00").unwrap();
+        std::fs::write(root.join("._music.flac"), b"fLaC").unwrap();
+        std::fs::write(root.join(".hidden.flac"), b"fLaC").unwrap();
+        std::fs::write(root.join("._short.mp3"), b"ID3").unwrap();
+
+        let units = walk(&root);
+        assert_eq!(units[0].1, ["._music.flac", "._short.mp3", ".hidden.flac", "song.flac"]);
     }
 
     /// Disc subfolders and sibling disc folders come with their album, whole, whatever is listed

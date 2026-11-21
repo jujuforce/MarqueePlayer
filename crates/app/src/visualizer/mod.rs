@@ -646,6 +646,14 @@ pub fn wake(st: &Rc<State>) {
     if still {
         still_frame(st, &app);
     }
+    // A menu or an unpinned sidebar may open between spectrum samples. Hand the
+    // complete scene to Skia before the overlay draws a backdrop filter over it.
+    #[cfg(target_os = "macos")]
+    if at.is_some() && app.global::<Visualizer>().get_native_underlay()
+        && app.global::<Theme>().get_glass() && !app.get_viz_fixed_glass()
+    {
+        frame(st);
+    }
 }
 
 fn stop(z: &mut Viz, app: &AppWindow) {

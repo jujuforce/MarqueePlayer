@@ -1,5 +1,6 @@
-//! The spectrum below the macOS software surface. Slint still draws the foreground,
-//! including the cover, lyrics and queue, and handles hit testing and accessibility.
+//! Core Animation draws the spectrum below the macOS window surface. In settled layouts,
+//! native glass blurs the spectrum while Slint draws foreground content and controls.
+//! Moving panels and overlays use the full Slint scene for their backdrop filters.
 
 use std::{ffi::c_void, time::Duration};
 
@@ -10,7 +11,7 @@ use super::{
     Look, Stage, Viz, Where, brush, draw,
     look::{ColourBy, Colours, Style},
 };
-use crate::{AppWindow, Backdrop, Player, Theme, Visualizer};
+use crate::{AppWindow, Backdrop, MenuStore, Nav, Player, StageBounds, Theme, Visualizer};
 
 #[repr(C)]
 struct Stop {
@@ -29,7 +30,7 @@ struct Bar {
 }
 
 unsafe extern "C" {
-    fn mp_spectrum_attach(view: *mut c_void) -> i32;
+    fn mp_spectrum_attach(view: *mut c_void, menu_open: bool, glass: bool) -> i32;
     fn mp_spectrum_remove();
     fn mp_spectrum_backdrop(base: u32, tint: u32, opacity: f32, rgb: *const u8, width: u32, height: u32);
     fn mp_spectrum_gradient(reflection: bool, stops: *const Stop, count: usize, angle: f32);
@@ -49,25 +50,36 @@ struct Background {
 #[derive(Default)]
 pub(super) struct Presenter {
     background: Option<Background>,
-    layout: Option<([f32; 6], u32)>,
+    layout: Option<([f32; 6], slint::PhysicalSize)>,
     bars: Vec<Bar>,
     pub(super) paths: draw::NativePaths,
     cover: Option<(Image, [f32; 4], bool)>,
     style: Option<Style>,
     panel: Option<([f32; 5], bool)>,
+    glass: Option<Glass>,
     pub(super) display_interval: Duration,
 }
 
+fn model_frames(style: Style, display_interval: Duration) -> u32 {
+    // Expanding ripples appear and expire independently. Draw their current contours
+    // each display frame so a departing ring never morphs into a newly born one.
+    if style == Style::Radial || display_interval >= Duration::from_millis(32) {
+        1
+    } else if style.beats() {
+        3
+    } else {
+        2
+    }
+}
+
 impl Presenter {
-    fn interpolated_interval(&self, timer: &slint::Timer, frames: u32) -> f64 {
-        if self.display_interval >= Duration::from_millis(32) {
-            return 0.0;
-        }
+    fn interpolated_interval(&self, timer: &slint::Timer, style: Style) -> f64 {
+        let frames = model_frames(style, self.display_interval);
         let model_interval = self.display_interval * frames;
         if timer.interval() != model_interval {
             timer.set_interval(model_interval);
         }
-        model_interval.as_secs_f64()
+        if frames == 1 { 0.0 } else { model_interval.as_secs_f64() }
     }
 
     pub(super) fn restore_interval(&self, timer: &slint::Timer) {
@@ -84,6 +96,7 @@ impl Presenter {
             self.layout = None;
             self.style = None;
             self.panel = None;
+            self.glass = None;
             self.cover = None;
             app.global::<Visualizer>().set_native_underlay(false);
         }
@@ -133,15 +146,16 @@ impl Presenter {
             reflection,
             app.window().scale_factor(),
         ];
-        let pixels = app.window().size().width;
+        let pixels = app.window().size();
         if self.layout == Some((dimensions, pixels)) {
             return;
         }
         let [x, y, width, top, reflection, scale] = dimensions;
         // SAFETY: geometry values are copied into the attached main-thread scene.
-        unsafe { mp_spectrum_layout(x, y, width, top, reflection, scale, pixels) };
+        unsafe { mp_spectrum_layout(x, y, width, top, reflection, scale, pixels.width) };
         self.layout = Some((dimensions, pixels));
         self.panel = None;
+        self.glass = None;
     }
 }
 
@@ -161,7 +175,10 @@ fn gradient(reflection: bool, brush: Brush) {
 
 pub(super) fn present(z: &mut Viz, app: &AppWindow, look: &Look, stage: &Stage, at: Where, dt: f32) -> bool {
     // Settings' preview sits inside its own scrollable surface.
-    if at == Where::Preview
+    let theme = app.global::<Theme>();
+    let glass = theme.get_glass();
+    if (glass && !app.get_viz_fixed_glass())
+        || at == Where::Preview
         || app.get_page_fade() < 1.0
         || (look.style.around()
             && (!app.global::<Player>().get_has_cover() || app.global::<Player>().get_full().size().width == 0))
@@ -172,8 +189,9 @@ pub(super) fn present(z: &mut Viz, app: &AppWindow, look: &Look, stage: &Stage, 
     let Ok(RawWindowHandle::AppKit(view)) = handle.window_handle().map(|h| h.as_raw()) else {
         return false;
     };
+    let menu = app.global::<MenuStore>();
     // SAFETY: AppKit's NSView comes from the live main-thread Slint window.
-    let attached = unsafe { mp_spectrum_attach(view.ns_view.as_ptr()) };
+    let attached = unsafe { mp_spectrum_attach(view.ns_view.as_ptr(), menu.get_open(), glass) };
     if attached == 0 {
         return false;
     }
@@ -197,6 +215,23 @@ pub(super) fn present(z: &mut Viz, app: &AppWindow, look: &Look, stage: &Stage, 
     let changed = brush(z, app, look, stage, at, at == Where::Behind);
     z.native.sync_background(app);
     z.native.sync_layout(app, stage, top, reflection);
+    let pill = app.get_viz_pill_frame();
+    let nav = app.global::<Nav>();
+    let panes = Glass {
+        blur: theme.get_glass_radius_blur(),
+        left: if nav.get_sidebar_pinned() { theme.get_sidebar_width() } else { 0.0 },
+        right: if nav.get_queue_pinned() { theme.get_queue_width() } else { 0.0 },
+        bar: if app.get_bar_visible() { theme.get_bar_height() } else { 0.0 },
+        pill: pill.into(),
+        menu: if menu.get_open() { menu.get_main_frame().into() } else { Rect::default() },
+        submenu: if menu.get_open() && menu.get_sub_of() >= 0 { menu.get_sub_frame().into() } else { Rect::default() },
+        menu_radius: theme.get_radius_card(),
+    };
+    if z.native.glass != Some(panes) {
+        // SAFETY: the scene owns the filters; it copies scalar layout values synchronously.
+        unsafe { mp_spectrum_glass(panes) };
+        z.native.glass = Some(panes);
+    }
     let frame = g.get_panel_frame();
     let panel = if at == Where::Panel {
         (
@@ -218,10 +253,8 @@ pub(super) fn present(z: &mut Viz, app: &AppWindow, look: &Look, stage: &Stage, 
         unsafe { mp_spectrum_panel(Rect { x, y, w, h }, radius, clip) };
         z.native.panel = Some(panel);
     }
+    let duration = z.native.interpolated_interval(&z.timer, look.style);
     if look.style != Style::Bars {
-        let duration = z
-            .native
-            .interpolated_interval(&z.timer, if look.style.beats() { 3 } else { 2 });
         z.draw.tick(dt);
         z.draw.draw_native(
             &mut z.native.paths,
@@ -263,9 +296,6 @@ pub(super) fn present(z: &mut Viz, app: &AppWindow, look: &Look, stage: &Stage, 
             reflection: b.reflection_height,
         }),
     );
-    // Core Animation draws intermediate display frames while the application
-    // thread and spectrum analyzer sleep between audio samples.
-    let duration = z.native.interpolated_interval(&z.timer, 2);
     // SAFETY: the presenter copies the bar geometry into its shape paths before returning.
     unsafe { mp_spectrum_bars(z.native.bars.as_ptr(), z.native.bars.len(), top, duration) };
     g.set_native_underlay(true);
@@ -288,12 +318,31 @@ const FRONT_GLOW: usize = 15;
 const FRONT: usize = 16;
 
 #[repr(C)]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default, PartialEq)]
 struct Rect {
     x: f32,
     y: f32,
     w: f32,
     h: f32,
+}
+
+impl From<StageBounds> for Rect {
+    fn from(frame: StageBounds) -> Self {
+        Self { x: frame.x, y: frame.y, w: frame.width, h: frame.height }
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq)]
+struct Glass {
+    blur: f32,
+    left: f32,
+    right: f32,
+    bar: f32,
+    pill: Rect,
+    menu: Rect,
+    submenu: Rect,
+    menu_radius: f32,
 }
 
 #[repr(C)]
@@ -314,6 +363,7 @@ impl From<&Vec<draw::PathCommand>> for Slice {
 
 unsafe extern "C" {
     fn mp_spectrum_clear_geometry();
+    fn mp_spectrum_glass(panes: Glass);
     fn mp_spectrum_panel(frame: Rect, radius: f32, clip: bool);
     fn mp_spectrum_paint(
         index: u32,
@@ -526,10 +576,50 @@ pub(crate) fn snapshot(app: &AppWindow) -> Option<slint::SharedPixelBuffer<slint
         return None;
     }
     unsafe extern "C" {
-        fn mp_spectrum_snapshot(rgba: *mut u8, width: u32, height: u32) -> bool;
+        fn mp_spectrum_snapshot(rgba: *mut u8, width: u32, height: u32) -> i32;
     }
     let size = app.window().size();
     let mut image = slint::SharedPixelBuffer::new(size.width, size.height);
     // SAFETY: the bitmap context writes exactly width × height RGBA pixels synchronously.
-    unsafe { mp_spectrum_snapshot(image.make_mut_bytes().as_mut_ptr(), size.width, size.height) }.then_some(image)
+    match unsafe { mp_spectrum_snapshot(image.make_mut_bytes().as_mut_ptr(), size.width, size.height) } {
+        1 => Some(image),
+        2 => {
+            let foreground = app.window().take_snapshot().ok()?;
+            if foreground.width() != size.width || foreground.height() != size.height {
+                return None;
+            }
+            // Skia supplies straight RGBA; the Core Graphics backdrop is premultiplied.
+            let (back, _) = image.make_mut_bytes().as_chunks_mut::<4>();
+            let (front, _) = foreground.as_bytes().as_chunks::<4>();
+            for (out, front) in back.iter_mut().zip(front) {
+                let alpha = u32::from(front[3]);
+                let combined = alpha * 255 + u32::from(out[3]) * (255 - alpha);
+                if let Some(weight) = std::num::NonZeroU32::new(combined) {
+                    for c in 0..3 {
+                        let color = u32::from(front[c]) * alpha + u32::from(out[c]) * (255 - alpha);
+                        out[c] = ((color * 255 + combined / 2) / weight) as u8;
+                    }
+                }
+                out[3] = ((combined + 127) / 255) as u8;
+            }
+            Some(image)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::visualizer::look::{frame_interval, Fps};
+
+    #[test]
+    fn ripples_advance_on_each_requested_display_frame() {
+        for fps in [Fps::Full, Fps::Half] {
+            for refresh in [24, 50, 60, 120] {
+                let interval = frame_interval(fps, Some(refresh));
+                assert_eq!(model_frames(Style::Radial, interval), 1);
+            }
+        }
+    }
 }

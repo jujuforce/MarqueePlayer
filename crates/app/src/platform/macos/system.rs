@@ -25,7 +25,14 @@ pub const HAS_SKIA_OPENGL: bool = false;
 
 /// Core Animation composites Slint's retained software tiles and the native visualizer.
 pub const TILED_RENDERER: &str = "Core Animation compositor, software-rendered UI tiles";
-pub const RENDERERS: &[(&str, &str)] = &[("software", TILED_RENDERER), ("skia", "Skia (Metal)")];
+pub const RENDERERS: &[(&str, &str)] = &[("skia", "Skia (Metal)"), ("software", TILED_RENDERER)];
+
+/// A headless Mac or a machine without a Metal device can still open the tiled player.
+pub fn has_metal_device() -> bool {
+    unsafe extern "C" { fn mp_macos_has_metal_device() -> bool; }
+    // SAFETY: the function checks Metal's default device without keeping it.
+    unsafe { mp_macos_has_metal_device() }
+}
 
 /// The menu bar's status item is always the static glyph: each frame of the moving one went
 /// through Slint's AppKit tray as a PNG encoded and decoded again, then a menu bar redraw, five

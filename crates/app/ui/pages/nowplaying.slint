@@ -393,6 +393,7 @@ export component NowPlayingPage inherits Rectangle {
         }
         // The queue, beside the art.
         panel := Rectangle {
+            cache-rendering-hint: Visualizer.cache-controls && !root.viz-tab && !Lyrics.shown;
             width: min(420px, root.width * 0.34);
             border-radius: Theme.radius-card;
             background: root.viz-tab && Visualizer.native-underlay ? transparent : #00000040;

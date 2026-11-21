@@ -168,13 +168,18 @@ The owner's decisions for the port, and how the code carries them out:
 - **Files**: the folder watcher is an FSEvents stream per watched folder (`library::dirwatch`,
   `fsevents.rs`; it reports real paths, given back under the path asked for). File names are
   compared as the file system does, case and Unicode normalisation ignored. Tag editing keeps a
-  file's extended attributes, as on Linux.
+  file's extended attributes, as on Linux. The scanner checks the AppleDouble signature
+  on audio filenames starting with `._` so it skips Finder metadata and keeps genuine tracks.
 - **The Finder, links, the clipboard** (`platform/macos/shell.rs`): "Show in Finder"
   (`open -R`), folders and web pages with `open`, the general pasteboard for Copy and Paste.
-- **Rendering** uses Slint's software renderer at the display's native scale. Core Animation
-  composites the changed tiles in an sRGB window. macOS color-manages the result for the
-  display. The transport uses the album's pre-blurred artwork.
-  Set `SLINT_BACKEND=winit-skia` to use Metal and live backdrop blur.
+- **Rendering.** macOS defaults to Skia on Metal with live backdrop blur. Core Animation
+  can draw the moving spectrum beneath the controls, including behind a stationary menu
+  or submenu. Skia draws the whole scene while sidebars slide. During steady playback,
+  the elapsed time and seek fill can update independently of the rest of the window.
+  The ordinary slider handles hovering, dragging and keyboard input.
+  For lower memory use, launch with `SLINT_BACKEND=winit-software`. This selects
+  retained tiles at the display's native scale and pre-blurred album art behind the
+  transport. Settings → About reports the window surface in use.
 - **Fonts** use San Francisco unless `theme.toml`'s `font_family` names another.
 - **Words**: "Show in Finder", "Exclusive mode" (not available), "Open at login"
   (`platform::Words`).
@@ -217,6 +222,59 @@ beta averaged 35.5% of one core with a median physical footprint of 787 MiB. The
 renderer with the Core Animation spectrum averaged 3.1% and 142 MiB. Retired instructions
 fell from 1.75 billion to 107 million per second. macOS adjusts CPU clock speed with load,
 so the same renderer's CPU percentage varies between runs.
+
+The Metal comparison below used the same machine, passage and window, seven seconds of
+warm-up and a fresh process per 32-second sample. The first row is commit `86c160e`
+with Metal explicitly selected. The other three rows ran the same revised release binary
+(`ed09a22`), which still selected tiled rendering by default.
+
+| Renderer and visualizer | CPU, % of one core | Median physical footprint |
+| --- | ---: | ---: |
+| Previous Metal, Classic | 49.65% | 683.3 MiB |
+| Metal with Core Animation, Classic | 5.23% | 686.4 MiB |
+| Tiled, Classic | 4.06% | 132.3 MiB |
+| Metal with Core Animation, Ripples at Full | 7.83% | 820.5 MiB |
+
+All three revised runs reported zero audio underruns. A window capture of Ripples
+at Full showed 58.4 distinct updates per second in the area around the cover. In that
+build, most of Metal's memory cost persisted even without a moving visualizer.
+
+On a copy of an existing library and its artwork cache, two startup scans tried to read
+tags from 3,535 AppleDouble files and took 275–282 ms. With the signature check, both
+scans finished in 107–112 ms, reported zero tag reads and preserved all 3,536 tracks.
+
+The previous installed build logged four Core Audio underruns at startup. After the scanner
+fix, two launches with Ripples at Full selected Metal automatically and logged zero
+startup underruns. The installed player resumed its 44-track queue and scanned the same
+3,536 files in 0.2 seconds, with no tags re-read.
+
+A 48-second comparison replayed the same menus and page changes in two muted copies
+of the 44-track queue on the M4 Max. Both used the same Metal executable, a fixed
+audio passage, pinned sidebars and full-rate Ripples. The control used the previous
+full-window painting for the transport and open menus. CPU is a percentage of one
+core and memory is the macOS physical footprint.
+
+| Workload | CPU before → after | Median footprint before → after |
+| --- | ---: | ---: |
+| Open menu over cover art | 34.0% → 5.8% | 1,017 → 572 MiB |
+| Open submenu | 34.2% → 4.3% | 958 → 480 MiB |
+| Changing pages | 12.8% → 9.2% | 1,002 → 932 MiB |
+| Menus, page changes and playback combined | 20.0% → 7.4% | 963 → 573 MiB |
+
+Across the sequence, peak CPU over one second fell from 36.1% to 17.3%. Peak
+footprint fell from 1,034 to 992 MiB. Page transitions still use the full Metal
+surface. Both runs advanced the audio playhead and reported zero underruns.
+
+Four 31-second launches compared the signed releases on the same Ripples passage and
+queue. After seven seconds of warm-up, the two control runs at `c1190b6` averaged
+9.26% and 9.29% CPU, with median footprints of 815 and 882 MiB. The two revised runs
+averaged 5.96% and 6.07% CPU, with median footprints of 288 and 406 MiB. All four
+selected Metal automatically and reported zero underruns.
+
+After installation, the signed release resumed the listener's queue with full-rate
+Ripples. Over two minutes it averaged 5.94% CPU, peaked at 8.77% over one second,
+and used a median 466 MiB with a peak of 889 MiB. Core Audio reported zero
+underruns and zero lost frames from launch through 130 seconds.
 
 Remaining platform checks include the following.
 

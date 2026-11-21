@@ -2,18 +2,13 @@
 // premultiplied foreground. The original view still owns all input and focus.
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
+#import <Metal/Metal.h>
+#import <CoreImage/CoreImage.h>
+#import <dispatch/dispatch.h>
 #import "particles.h"
 
-// Inspect only the window surface. Metal layers nested inside the visualizer draw
-// individual effects and do not change how Slint draws the window.
-int mp_macos_window_surface(void *rawView) {
-    CALayer *root = ((__bridge NSView *)rawView).layer;
-    if ([root isKindOfClass:CAMetalLayer.class] && ((CAMetalLayer *)root).device) return 2;
-    for (CALayer *layer in root.sublayers) {
-        if ([layer.name isEqualToString:@"MarqueeSlintForeground"]) return 1;
-        if ([layer isKindOfClass:CAMetalLayer.class] && ((CAMetalLayer *)layer).device) return 2;
-    }
-    return 0;
+bool mp_macos_has_metal_device(void) {
+    return MTLCreateSystemDefaultDevice() != nil;
 }
 
 typedef struct { float position; uint32_t argb; } MPStop;
@@ -22,6 +17,7 @@ typedef struct { float x, width, height, radius, cap, reflection; } MPBar;
 enum { Bloom, Fill, Glow, Line, Caps, Reflection, Ripples = Reflection+6,
        SparksGlow, SparksOld, Sparks, FrontGlow, Front, LayerCount };
 typedef struct { float x, y, w, h; } MPRect;
+typedef struct { float blur, left, right, bar; MPRect pill, menu, submenu; float menu_radius; } MPGlass;
 
 @interface MPPathMask : CAShapeLayer
 @property(nonatomic) size_t sampleCount;
@@ -43,11 +39,19 @@ typedef struct { float x, y, w, h; } MPRect;
 @property(nonatomic, weak) CALayer *foreground;
 @property(nonatomic) size_t barCount;
 @property(nonatomic) float baseline;
+@property(nonatomic, strong) NSArray<CALayer *> *glassPanes;
 @end
 @implementation MPBarScene
 @end
 
 static MPBarScene *scene;
+
+static CIFilter *glassBlur(void) {
+    static CIFilter *blur;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ blur = [CIFilter filterWithName:@"CIGaussianBlur"]; });
+    return blur;
+}
 
 static NSColor *color(uint32_t argb) {
     return [NSColor colorWithSRGBRed:((argb >> 16) & 255) / 255.0
@@ -65,15 +69,17 @@ static CAGradientLayer *maskedGradient(CALayer *parent) {
 
 // Called on the UI thread. The foreground may be recreated on hide or renderer change.
 // 0 = incompatible surface, 1 = same scene, 2 = new scene needing its brushes and art.
-int mp_spectrum_attach(void *rawView) {
+int mp_spectrum_attach(void *rawView, bool menuOpen, bool glass) {
     NSView *view = (__bridge NSView *)rawView;
+    if ((menuOpen && view.inLiveResize) || (glass && !glassBlur())) return 0;
     CALayer *root = view.layer;
     if (scene && scene.superlayer == root && scene.foreground.superlayer == root && root) return 1;
     [scene removeFromSuperlayer];
     scene = nil;
     CALayer *front = nil;
     for (CALayer *candidate in root.sublayers) {
-        if ([candidate.name isEqualToString:@"MarqueeSlintForeground"]) {
+        if ([candidate.name isEqualToString:@"MarqueeSlintForeground"] ||
+            ([candidate isKindOfClass:CAMetalLayer.class] && ((CAMetalLayer *)candidate).device)) {
             front = candidate;
             break;
         }
@@ -227,6 +233,42 @@ void mp_spectrum_panel(MPRect frame, float radius, bool clip) {
     scene.panel.frame = CGRectMake(frame.x*p, frame.y*p, frame.w*p, frame.h*p);
     scene.panel.cornerRadius = radius*p;
     scene.stage.masksToBounds = clip;
+    [CATransaction commit];
+}
+
+// The native planes blur the live spectrum and backdrop. Skia still blurs page
+// content on its own foreground plane and supplies the exact panel tint and border.
+void mp_spectrum_glass(MPGlass panes) {
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    for (CALayer *pane in scene.glassPanes) [pane removeFromSuperlayer];
+    scene.glassPanes = nil;
+    if (panes.blur > 0) {
+        CGFloat p = scene.points, w = scene.bounds.size.width, h = scene.bounds.size.height;
+        CGFloat left = p * panes.left, right = p * panes.right, bar = p * panes.bar;
+        CGRect boxes[] = {
+            CGRectMake(0, 0, left, h - bar), CGRectMake(w - right, 0, right, h - bar),
+            CGRectMake(0, h - bar, w, bar),
+            CGRectMake(p * panes.pill.x, p * panes.pill.y, p * panes.pill.w, p * panes.pill.h),
+            CGRectMake(p * panes.menu.x, p * panes.menu.y, p * panes.menu.w, p * panes.menu.h),
+            CGRectMake(p * panes.submenu.x, p * panes.submenu.y, p * panes.submenu.w, p * panes.submenu.h),
+        };
+        NSMutableArray<CALayer *> *layers = [NSMutableArray arrayWithCapacity:6];
+        for (unsigned i = 0; i < sizeof(boxes)/sizeof(boxes[0]); i++) {
+            if (CGRectIsEmpty(boxes[i])) continue;
+            CALayer *pane = [CALayer layer];
+            pane.frame = boxes[i];
+            pane.masksToBounds = YES;
+            if (i == 3) pane.cornerRadius = boxes[i].size.height / 2;
+            if (i >= 4) pane.cornerRadius = panes.menu_radius * p;
+            CIFilter *blur = [glassBlur() copy];
+            [blur setValue:@(panes.blur * p * scene.superlayer.contentsScale) forKey:kCIInputRadiusKey];
+            pane.backgroundFilters = @[blur];
+            [scene addSublayer:pane];
+            [layers addObject:pane];
+        }
+        scene.glassPanes = layers;
+    }
     [CATransaction commit];
 }
 
@@ -437,7 +479,7 @@ float mp_spectrum_cover_scale(void) {
 }
 
 // Slint's own snapshot contains only the foreground while native bars are active.
-bool mp_spectrum_snapshot(uint8_t *rgba, uint32_t width, uint32_t height) {
+int mp_spectrum_snapshot(uint8_t *rgba, uint32_t width, uint32_t height) {
     CALayer *root = scene.superlayer;
     CGSize size = root.bounds.size;
     if (!root || !(size.width > 0 && size.height > 0) || !rgba) return false;
@@ -453,8 +495,11 @@ bool mp_spectrum_snapshot(uint8_t *rgba, uint32_t width, uint32_t height) {
         CGContextScaleCTM(context, 1, -1);
     }
     CGContextScaleCTM(context, width / size.width, height / size.height);
-    [root renderInContext:context];
+    // The model tree contains the software tiles, but a CAMetalLayer drawable
+    // cannot be read by renderInContext. Its renderer supplies that plane separately.
+    bool metal = [scene.foreground isKindOfClass:CAMetalLayer.class];
+    [(metal ? (CALayer *)scene : root) renderInContext:context];
     CGContextRelease(context);
-    return true;
+    return metal ? 2 : 1;
 }
 #endif

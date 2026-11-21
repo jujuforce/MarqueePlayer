@@ -1,6 +1,6 @@
 import { Theme } from "theme.slint";
 import { AlbumCard, TrackRow, ArtistLink } from "types.slint";
-import { Playlists, Actions, Focus, SettingsView, Player, Nav, Server } from "stores.slint";
+import { Playlists, Actions, Focus, SettingsView, Player, Nav, Server, StageBounds } from "stores.slint";
 
 // 24x24 SVG path data (Material-style glyphs), drawn with `Icon`.
 export global Icons {
@@ -532,6 +532,14 @@ export component AlbumTile inherits Rectangle {
 // keeps showing that target until `value` arrives within `settle` of it (or 1.5 s pass),
 // so a seek bar never jumps back to the old position while the seek lands.
 export component Slider inherits Rectangle {
+    // Only the idle seek fill can be presented separately on macOS.
+    in property <bool> external-fill;
+    out property <bool> resting: !ta.has-hover && !fs.has-focus && !root.active;
+    private property <length> filled-width: rail.width * clamp(root.shown, 0, 1);
+    out property <StageBounds> fill-frame: {
+        x: rail.absolute-position.x, y: rail.absolute-position.y,
+        width: root.filled-width, height: rail.height,
+    };
     in property <float> value;
     in property <bool> enabled: true;
     // How close `value` must come to the released target to count as arrived.
@@ -598,7 +606,7 @@ export component Slider inherits Rectangle {
         running: root.hold >= 0 && !ta.pressed;
         triggered => { root.hold = -1; }
     }
-    Rectangle {
+    rail := Rectangle {
         y: (parent.height - self.height) / 2;
         height: ta.has-hover || ta.pressed ? 6px : 4px;
         animate height { duration: Theme.dur-hover; }
@@ -606,14 +614,14 @@ export component Slider inherits Rectangle {
         background: #ffffff26;
         Rectangle {
             x: 0;
-            width: parent.width * clamp(root.shown, 0, 1);
+            width: root.external-fill ? 0px : root.filled-width;
             height: parent.height;
             border-radius: parent.border-radius;
             background: ta.has-hover || ta.pressed ? Theme.accent : Theme.text;
         }
     }
     Rectangle {
-        x: root.width * clamp(root.shown, 0, 1) - self.width / 2;
+        x: root.external-fill ? 0px : root.width * clamp(root.shown, 0, 1) - self.width / 2;
         y: (parent.height - self.height) / 2;
         width: 12px;
         height: 12px;

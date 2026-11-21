@@ -168,9 +168,14 @@ pub(crate) fn out_dir() -> PathBuf {
 
 pub(crate) fn window_pixels(app: &AppWindow) -> Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
     #[cfg(target_os = "macos")]
-    if let Some(frame) = crate::visualizer::macos::snapshot(app) {
-        return Some(frame);
+    {
+        let mut frame = crate::visualizer::macos::snapshot(app).or_else(|| app.window().take_snapshot().ok())?;
+        unsafe extern "C" { fn mp_transport_snapshot(rgba: *mut u8, width: u32, height: u32); }
+        // SAFETY: the main-thread presenter paints over this whole, uniquely borrowed RGBA buffer.
+        unsafe { mp_transport_snapshot(frame.make_mut_bytes().as_mut_ptr(), frame.width(), frame.height()) };
+        Some(frame)
     }
+    #[cfg(not(target_os = "macos"))]
     app.window().take_snapshot().ok()
 }
 

@@ -554,7 +554,8 @@ pub fn toggle_visualizer(st: &Rc<State>) {
 /// Skia's dual-source-blend shaders fail to link ("all must have location qualifiers"),
 /// and the draws that need them, the backdrop blur of a moving panel among them, are
 /// silently dropped. Linux: Skia through wgpu (Vulkan), else Skia on OpenGL (EGL or GLX:
-/// GPUs and drivers without Vulkan), else software. macOS: retained software tiles on Core Animation, else Skia on Metal.
+/// GPUs and drivers without Vulkan), else software. macOS tries Skia on Metal first,
+/// then retained software tiles on Core Animation.
 /// Returns whether glass is available.
 /// `SLINT_BACKEND` still wins when set (`winit-skia-opengl` for the frame-timing bench,
 /// whose rendering notifier the wgpu surface does not call; on Windows that renderer is
@@ -564,18 +565,29 @@ fn select_renderer() -> bool {
         // Keep the native window chrome and the bench placement with an explicit backend too.
         let lower = forced.to_lowercase();
         if lower == "winit-skia-opengl" && !cfg!(feature = "bench-opengl") && !platform::system::HAS_SKIA_OPENGL {
-            crash::fatal_at_start(&format!("SLINT_BACKEND={forced} requires the bench-opengl build feature on this platform. Remove the override to use the default renderer."));
+            log::warn!("SLINT_BACKEND={forced}: this build has no Skia OpenGL renderer");
+        } else {
+            match platform::explicit_renderer(selector(), &lower).select() {
+                Ok(()) => {
+                    platform::configure_renderer(lower.strip_prefix("winit-").unwrap_or(&lower));
+                    about::set_renderer(&format!("requested {forced}"));
+                    return lower.contains("skia") && !lower.contains("software");
+                }
+                Err(e) => log::warn!("SLINT_BACKEND={forced}: {e}; trying the platform defaults"),
+            }
         }
-        if let Err(e) = platform::explicit_renderer(selector(), &lower).select() {
-            crash::fatal_at_start(&format!("Marquee Player could not select SLINT_BACKEND={forced}: {e}. Remove the override to use the default renderer."));
-        }
-        platform::configure_renderer(lower.strip_prefix("winit-").unwrap_or(&lower));
-        about::set_renderer(&format!("requested {forced}"));
-        return lower.contains("skia") && !lower.contains("software");
     }
     let mut last = String::new();
     for (name, label) in platform::system::RENDERERS {
-        match selector().renderer_name((*name).into()).select() {
+        #[cfg(target_os = "macos")]
+        if *name == "skia" && !platform::system::has_metal_device() {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        let renderer = platform::explicit_renderer(selector(), &format!("winit-{name}"));
+        #[cfg(not(target_os = "macos"))]
+        let renderer = selector().renderer_name((*name).into());
+        match renderer.select() {
             Ok(()) => {
                 platform::configure_renderer(name);
                 about::set_renderer(label);

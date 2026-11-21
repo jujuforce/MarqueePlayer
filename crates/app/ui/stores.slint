@@ -2,9 +2,18 @@
 // (`app.global::<X>()`) and handles every callback in `Actions`.
 import { AlbumCard, TrackRow, ShelfView, QueueRow, PlaylistRow, NamedCount, ShelfEdit, Page, ShelfLayout, MenuItemData, KeyHelp, KeyRow, LyricLine, SettingHit, MetaRow, AboutFile, AboutCredit, ArtistLink, SmartRow, EqBandRow, EqNote, VizPresetRow } from "types.slint";
 
+export struct StageBounds {
+    x: length, y: length, width: length, height: length,
+}
+
 // The open context menu (menu.slint). Rust fills the entries and runs the chosen one.
 export global MenuStore {
     in-out property <bool> open;
+    // Actual laid-out bounds, after the main menu and submenu have been flipped or clamped.
+    in-out property <StageBounds> main-frame;
+    in-out property <StageBounds> sub-frame;
+    changed open => { if !self.open { self.main-frame = {}; self.sub-frame = {}; } }
+    changed sub-of => { if self.sub-of < 0 { self.sub-frame = {}; } }
     // Where it was asked for, in window coordinates.
     in-out property <length> x;
     in-out property <length> y;
@@ -565,8 +574,10 @@ export global Lyrics {
 // panel's tab, the full page, or the Settings preview. Each frame is a few paths in the
 // stage's logical pixels: the top box (`top-h` high, the bars rising from its foot) and
 // under it the reflection's (`refl-h`), with brushes Rust builds when the look changes.
-export struct StageBounds {
-    x: length, y: length, width: length, height: length,
+// The changing pixels of the steady macOS transport, in Slint logical coordinates.
+export struct ProgressPaint {
+    fill: StageBounds, clock: StageBounds, elapsed: string, family: string,
+    font-size: length, ink: color, dim: color,
 }
 
 export global Visualizer {
@@ -618,6 +629,9 @@ export global Visualizer {
     in-out property <bool> active;
     // On macOS the compositor can draw the spectrum and backdrop below the UI.
     in-out property <bool> native-underlay;
+    // Cache the controls above moving Slint-drawn paths. Their glass stays live underneath.
+    in-out property <bool> metal-surface;
+    out property <bool> cache-controls: metal-surface && active && !still && !native-underlay;
     in-out property <bool> still;
     // The stage's size, from the stage shown (Rust lays the frame out across it).
     in-out property <length> stage-width;

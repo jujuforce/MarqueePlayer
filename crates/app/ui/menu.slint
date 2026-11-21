@@ -6,7 +6,7 @@
 // highlighted, and the list keeps the focus and passes those keys on (lists.slint).
 import { Theme } from "theme.slint";
 import { MenuItemData } from "types.slint";
-import { MenuStore, Actions } from "stores.slint";
+import { MenuStore, Actions, StageBounds, Visualizer } from "stores.slint";
 import { Icon, Icons } from "widgets.slint";
 
 component MenuRow inherits Rectangle {
@@ -87,6 +87,18 @@ component MenuRow inherits Rectangle {
 }
 
 component MenuPanel inherits Rectangle {
+    in property <bool> submenu;
+    private property <StageBounds> glass-frame: {
+        x: self.absolute-position.x, y: self.absolute-position.y, width: self.width, height: self.height,
+    };
+    function publish-frame() {
+        if Visualizer.metal-surface {
+            if self.submenu { MenuStore.sub-frame = self.glass-frame; }
+            else { MenuStore.main-frame = self.glass-frame; }
+        }
+    }
+    init => { self.publish-frame(); }
+    changed glass-frame => { self.publish-frame(); }
     in property <[MenuItemData]> entries;
     in property <int> highlight;
     in property <bool> indent;
@@ -178,6 +190,7 @@ export component AppMenu inherits Rectangle {
             }
         }
         if MenuStore.sub-of >= 0: MenuPanel {
+            submenu: true;
             // Beside the entry, on the right, or on the left when there is no room.
             x: main.x + main.width + self.width - 4px <= root.window-width - 8px ? main.x + main.width - 4px : max(8px, main.x - self.width + 4px);
             y: max(8px, min(main.y + MenuStore.sub-row-y - 6px, root.window-height - self.height - 8px));

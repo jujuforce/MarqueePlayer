@@ -64,7 +64,7 @@ pub fn configure_renderer(_name: &str) {
     softbuffer::set_macos_premultiplied_layer(matches!(_name, "software" | "sw").then_some("MarqueeSlintForeground"));
 }
 
-/// On macOS the full-window Skia override requests Metal explicitly. The generic Skia
+/// On macOS selecting Skia requests Metal explicitly. The generic Skia
 /// renderer can otherwise fall back to its software surface when GPU initialization fails.
 pub fn explicit_renderer(selector: slint::BackendSelector, name: &str) -> slint::BackendSelector {
     #[cfg(target_os = "macos")]
