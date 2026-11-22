@@ -339,7 +339,7 @@ export component NowPlayingPage inherits Rectangle {
                         hub-size: root.halo-cover / 2;
                         open: true;
                     }
-                    Cover {
+                    if !root.halo-behind || !Visualizer.native-underlay: Cover {
                         x: (parent.width - self.width) / 2;
                         y: (parent.height - self.height) / 2;
                         size: root.halo-cover * (root.halo-behind ? Visualizer.cover-scale : 1);
@@ -392,10 +392,11 @@ export component NowPlayingPage inherits Rectangle {
             }
         }
         // The queue, beside the art.
-        Rectangle {
+        panel := Rectangle {
+            cache-rendering-hint: Visualizer.cache-controls && !root.viz-tab && !Lyrics.shown;
             width: min(420px, root.width * 0.34);
             border-radius: Theme.radius-card;
-            background: #00000040;
+            background: root.viz-tab && Visualizer.native-underlay ? transparent : #00000040;
             VerticalLayout {
                 padding: 16px;
                 spacing: 8px;
@@ -440,7 +441,11 @@ export component NowPlayingPage inherits Rectangle {
                         clicked => { Actions.lyrics-menu(self.absolute-position.x + self.width - 236px, self.absolute-position.y + self.height + 6px, false); }
                     }
                 }
-                if root.viz-tab: VisualizerStage { vertical-stretch: 1; cover: true; }
+                if root.viz-tab: VisualizerStage {
+                    vertical-stretch: 1;
+                    cover: true;
+                    panel-frame: { x: panel.absolute-position.x, y: panel.absolute-position.y, width: panel.width, height: panel.height };
+                }
                 if !root.viz-tab && !Lyrics.shown: QueueList { vertical-stretch: 1; }
                 if !root.viz-tab && Lyrics.shown: LyricsView { vertical-stretch: 1; max-height: 100000px; }
                 if !root.viz-tab && Lyrics.shown && Lyrics.notice != "": LyricsNotice { vertical-stretch: 0; }

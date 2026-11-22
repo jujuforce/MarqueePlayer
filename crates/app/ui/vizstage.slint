@@ -1,7 +1,7 @@
 // The visualizer's stage: where it draws, on Now playing and in Settings > Visualizer's preview.
 
 import { Theme } from "theme.slint";
-import { Player, Actions, Visualizer } from "stores.slint";
+import { Player, Actions, Visualizer, StageBounds } from "stores.slint";
 import { Cover } from "widgets.slint";
 
 // What a look draws in front of the cover (Saturn's near grains): over the cover, where the
@@ -35,6 +35,8 @@ export component VisualizerStage inherits Rectangle {
     // box of its own (the panel's tab, the Settings preview) they leave it at its edge;
     // where it is the page (`open`), they go on over it and fade.
     in property <bool> open;
+    in property <StageBounds> panel-frame;
+    changed panel-frame => { Visualizer.panel-frame = self.panel-frame; }
     clip: Visualizer.ring && !root.open;
     // The halo's hub, in the stage's middle: the cover it surrounds (its half size, its
     // radius when round). Behind the page that is the page's own cover (`hub-size`, the
@@ -43,13 +45,20 @@ export component VisualizerStage inherits Rectangle {
     in property <length> hub-size: 0px;
     in property <bool> cover;
     out property <length> hub: root.hub-size > 0 ? root.hub-size : max(6px, (min(root.width, root.height) / 2 - 2px) * 0.58);
+    private property <length> stage-x: self.absolute-position.x;
+    private property <length> stage-y: self.absolute-position.y;
     accessible-role: none;
     init => {
+        Visualizer.panel-frame = self.panel-frame;
         Visualizer.stage-width = self.width;
         Visualizer.stage-height = self.height;
+        Visualizer.stage-x = self.stage-x;
+        Visualizer.stage-y = self.stage-y;
         Visualizer.stage-hub = self.hub;
         Actions.visualizer-wake();
     }
+    changed stage-x => { Visualizer.stage-x = self.stage-x; }
+    changed stage-y => { Visualizer.stage-y = self.stage-y; }
     changed width => {
         Visualizer.stage-width = self.width;
         Actions.visualizer-wake();
@@ -63,7 +72,7 @@ export component VisualizerStage inherits Rectangle {
         Actions.visualizer-wake();
     }
     // The bloom: light from behind the cover (the ring, Saturn), brighter with the low notes.
-    if Visualizer.ring: Rectangle {
+    if Visualizer.ring && !Visualizer.native-underlay: Rectangle {
         width: root.width;
         height: root.height;
         visible: Visualizer.active;
@@ -206,7 +215,7 @@ export component VisualizerStage inherits Rectangle {
     }
     // The halo's hub: the playing cover, round (or its own rounded square), over the
     // contour's foot; at rest the contour is a thin lit line around it.
-    if root.cover && Visualizer.ring: Cover {
+    if root.cover && Visualizer.ring && !Visualizer.native-underlay: Cover {
         size: root.hub * 2 * Visualizer.cover-scale;
         x: (root.width - self.width) / 2;
         y: (root.height - self.height) / 2;

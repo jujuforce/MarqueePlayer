@@ -398,12 +398,11 @@ export component LongTrackList inherits Rectangle {
                 // Remove from the playlist; shown on hover, like the row's other actions.
                 if root.editable: IconButton {
                     y: 10px;
-                    glyph: Icons.close;
+                    glyph: row.hovered || self.has-hover || row.focused ? Icons.close : "";
                     size: 32px;
                     icon-size: 16px;
                     label: "Remove from playlist";
                     tabbable: false;
-                    opacity: row.hovered || self.has-hover || row.focused ? 1 : 0;
                     clicked => { Actions.playlist-remove(parent.i); }
                 }
             }
@@ -637,7 +636,7 @@ export component QueueList inherits Rectangle {
                         ArtistLinks { text: q.artist; ref-id: q.track-id; context-requested(x, y) => { Actions.menu-request("queue", "", i, 0, x, y); } }
                     }
                     Text { width: 40px; text: q.duration; vertical-alignment: center; horizontal-alignment: right; font-size: Theme.font-small; color: Theme.text-dim; }
-                    IconButton { y: 10px; glyph: Icons.close; size: 32px; icon-size: 16px; label: "Remove from queue"; tabbable: false; opacity: qta.has-hover || (root.ring && i == root.at) ? 1 : 0; clicked => { Actions.queue-remove(i); } }
+                    IconButton { y: 10px; glyph: qta.has-hover || (root.ring && i == root.at) ? Icons.close : ""; size: 32px; icon-size: 16px; label: "Remove from queue"; tabbable: false; clicked => { Actions.queue-remove(i); } }
                 }
                     }
                 }

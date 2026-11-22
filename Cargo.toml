@@ -61,13 +61,13 @@ opt-level = "z"
 
 # Crates that never run while scrolling, playing or scanning, optimized for size
 # (0.9 MB together): SVG icons are rasterized once and cached; naga translates wgpu's
-# few shaders at start; the software renderer is only the fallback when Skia cannot
-# start; settings and theme files are read at start and saved on change; menus, file
+# few shaders at start; settings and theme files are read at start and saved on change; menus, file
 # dialogs and the media-key session wait for the user. Not here: text layout and
 # shaping (parley, harfrust, skrifa, swash, zeno), wgpu-core and wgpu-hal, winit and
 # accesskit, which at "z" together made scrolling the album grid measurably slower
 # (frame p95 19.5 -> 26.5 ms); and Slint's own crates, whose generic code is compiled
-# into the UI crate, so at "z" they made the exe bigger, not smaller.
+# into the UI crate, so at "z" they made the exe bigger, not smaller. The software
+# renderer and softbuffer also run during playback on macOS.
 [profile.release.package.naga]
 opt-level = "z"
 [profile.release.package.usvg]
@@ -87,10 +87,6 @@ opt-level = "z"
 [profile.release.package.kurbo]
 opt-level = "z"
 [profile.release.package.gif]
-opt-level = "z"
-[profile.release.package.i-slint-renderer-software]
-opt-level = "z"
-[profile.release.package.softbuffer]
 opt-level = "z"
 [profile.release.package.serde_json]
 opt-level = "z"
@@ -137,7 +133,7 @@ codegen-units = 16
 incremental = true
 
 
-# A dependency fixed here until upstream is (crates/patches/README.md). Linux only in effect:
-# nothing in the Windows build depends on it.
+# Fixes for platform-specific dependencies (crates/patches/README.md).
 [patch.crates-io]
 blocking = { path = "crates/patches/blocking" }
+softbuffer = { path = "crates/patches/softbuffer" }

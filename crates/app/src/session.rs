@@ -138,6 +138,7 @@ pub fn restore(st: &Rc<State>) {
         p.set_shuffle(shuffle);
         p.set_repeat(playback::repeat_index(repeat));
     }
+    st.models.queue.invalidate();
     playback::refresh_queue(st);
     playback::refresh_now_playing(st);
     if let Some(item) = current {

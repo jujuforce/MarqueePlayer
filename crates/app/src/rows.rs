@@ -9,7 +9,7 @@ use library::audio::{self, Column, FormatKey};
 use slint::{Image, Model, ModelNotify, ModelTracker};
 
 use crate::covers::{self, CoverListener, Kind};
-use crate::queue::Item;
+use crate::queue::Queue;
 use crate::selection::Selection;
 use crate::{QueueRow, TrackRow};
 
@@ -285,7 +285,8 @@ impl CoverListener for TrackModel {
 
 /// The play queue as shown in the queue panel and on the now-playing page.
 pub struct QueueModel {
-    items: RefCell<Vec<Item>>,
+    queue: Rc<RefCell<Queue>>,
+    revision: Cell<Option<u64>>,
     current: Cell<Option<usize>>,
     waiting: Waiting,
     /// Which rows are chosen, by item uid (they keep it through moves and additions).
@@ -294,9 +295,10 @@ pub struct QueueModel {
 }
 
 impl QueueModel {
-    pub fn new() -> Rc<Self> {
+    pub fn new(queue: Rc<RefCell<Queue>>) -> Rc<Self> {
         let m = Rc::new(Self {
-            items: RefCell::default(),
+            queue,
+            revision: Cell::new(None),
             current: Cell::new(None),
             waiting: Waiting::default(),
             selection: RefCell::default(),
@@ -307,12 +309,31 @@ impl QueueModel {
         m
     }
 
-    pub fn set(&self, items: &[Item], current: Option<usize>) {
-        self.selection.borrow_mut().rekey(items.iter().map(|i| i.uid).collect());
-        *self.items.borrow_mut() = items.to_vec();
-        self.current.set(current);
+    /// A rescan changed metadata, or the session replaced the entire queue.
+    pub fn invalidate(&self) {
+        self.revision.set(None);
+    }
+
+    /// A track change only moves the highlight. Return true if the row list changed.
+    pub fn refresh(&self) -> bool {
+        let q = self.queue.borrow();
+        let current = q.current_index();
+        let previous = self.current.replace(current);
+        let revision = Some(q.revision());
+        if self.revision.replace(revision) == revision {
+            drop(q);
+            if previous != current {
+                for row in [previous, current].into_iter().flatten() {
+                    self.notify.row_changed(row);
+                }
+            }
+            return false;
+        }
+        self.selection.borrow_mut().rekey(q.items().iter().map(|i| i.uid).collect());
+        drop(q);
         self.waiting.clear();
         self.notify.reset();
+        true
     }
 }
 
@@ -320,12 +341,12 @@ impl Model for QueueModel {
     type Data = QueueRow;
 
     fn row_count(&self) -> usize {
-        self.items.borrow().len()
+        self.queue.borrow().items().len()
     }
 
     fn row_data(&self, row: usize) -> Option<QueueRow> {
-        let items = self.items.borrow();
-        let t = &items.get(row)?.track;
+        let q = self.queue.borrow();
+        let t = &q.items().get(row)?.track;
         Some(QueueRow {
             title: t.title.as_str().into(),
             track_id: t.id.max(0) as i32,
@@ -361,7 +382,7 @@ impl CoverListener for QueueModel {
         if kind != Kind::Thumb {
             return;
         }
-        let n = self.items.borrow().len();
+        let n = self.row_count();
         for r in self.waiting.take(stem) {
             if r < n {
                 self.notify.row_changed(r);
@@ -375,7 +396,33 @@ impl CoverListener for QueueModel {
 
 #[cfg(test)]
 mod tests {
-    use super::format_time;
+    use super::*;
+
+    #[test]
+    fn queue_highlight_moves_without_resetting_rows() {
+        let queue = Rc::new(RefCell::new(Queue::default()));
+        let model = QueueModel::new(queue.clone());
+        let tracks = [1, 2].map(|id| Track { id, ..Default::default() });
+        queue.borrow_mut().replace(tracks.into(), 0);
+        assert!(model.refresh());
+        model.selection.borrow_mut().only(0, &mut Vec::new());
+
+        queue.borrow_mut().jump(1);
+        assert!(!model.refresh());
+        let first = model.row_data(0).unwrap();
+        assert!(first.selected && !first.current);
+        assert!(model.row_data(1).unwrap().current);
+
+        queue.borrow_mut().move_item(0, 1);
+        assert!(model.refresh());
+        assert!(model.row_data(1).unwrap().selected);
+        assert!(model.row_data(0).unwrap().current);
+
+        queue.borrow_mut().update_tracks(|id| Some(Track { id, title: "Edited".into(), ..Default::default() }));
+        model.invalidate();
+        assert!(model.refresh());
+        assert_eq!(model.row_data(1).unwrap().title.as_str(), "Edited");
+    }
 
     #[test]
     fn times() {

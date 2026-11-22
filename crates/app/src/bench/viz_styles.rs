@@ -238,7 +238,7 @@ pub fn run() {
             for k in 0..12 {
                 let (frames, t0) = (frames.clone(), t0.clone());
                 steps.push((if k == 0 { 1500 } else { 17 }, Box::new(move |_st, app| {
-                    if let Ok(buf) = app.window().take_snapshot()
+                    if let Some(buf) = super::window_pixels(app)
                         && let Some(img) = image::RgbaImage::from_raw(buf.width(), buf.height(), buf.as_bytes().to_vec())
                     {
                         frames.borrow_mut().push((img, t0.get().elapsed().as_millis(), app.global::<Visualizer>().get_frame()));

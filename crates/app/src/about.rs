@@ -73,7 +73,7 @@ pub fn set_renderer(name: &str) {
 }
 
 pub fn renderer() -> &'static str {
-    RENDERER.get().map_or("renderer not chosen yet", String::as_str)
+    crate::platform::window_renderer(RENDERER.get().map_or("renderer not chosen yet", String::as_str))
 }
 /// "Windows 11 24H2 (build 26100.2605)", "Ubuntu 24.04.1 LTS (Linux 6.8), KDE on Wayland":
 /// what the app runs on, read once (`platform::system::os_version`).
@@ -83,13 +83,18 @@ pub fn os_version() -> &'static str {
 
 /// The line "Copy" puts on the clipboard, for a bug report: name, version and edition,
 /// Windows, renderer.
-pub fn report_line(version: &str, edition: &str, windows: &str, renderer: &str) -> String {
-    format!("{NAME} {version} ({edition}) \u{b7} {windows} \u{b7} x64 \u{b7} {renderer}")
+pub fn report_line(version: &str, edition: &str, os: &str, arch: &str, renderer: &str) -> String {
+    format!("{NAME} {version} ({edition}) \u{b7} {os} \u{b7} {arch} \u{b7} {renderer}")
 }
 
 /// This run's report line.
 pub fn this_report_line() -> String {
-    report_line(VERSION, crate::edition::get().short(), os_version(), renderer())
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "x64",
+        other => other,
+    };
+    report_line(VERSION, crate::edition::get().short(), os_version(), arch, renderer())
 }
 
 // ---- where the files are ----------------------------------------------------------------
@@ -537,7 +542,7 @@ mod tests {
     #[test]
     fn the_report_line_names_everything_a_bug_report_needs() {
         assert_eq!(
-            report_line("2026.11.15.3", "portable", "Windows 11 24H2 (build 26100.2605)", "Skia (Direct3D 12 through wgpu)"),
+            report_line("2026.11.15.3", "portable", "Windows 11 24H2 (build 26100.2605)", "x64", "Skia (Direct3D 12 through wgpu)"),
             "Marquee Player 2026.11.15.3 (portable) \u{b7} Windows 11 24H2 (build 26100.2605) \u{b7} x64 \u{b7} Skia (Direct3D 12 through wgpu)"
         );
         assert!(this_report_line().starts_with(&format!("Marquee Player {VERSION} ({}) \u{b7} {}", crate::edition::get().short(), os_version())));

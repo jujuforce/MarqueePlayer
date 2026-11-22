@@ -53,8 +53,9 @@ impl Kind {
 /// few screens of a 4K grid. Images on screen hold their own reference, so eviction
 /// never blanks anything visible; it only means a decode if a row asks again.
 const THUMB_BUDGET: usize = 96 << 20;
-/// Full-size and blurred images: few at a time (album page, now playing, backdrop).
-const LARGE_BUDGET: usize = 64 << 20;
+/// Three 1200 px RGB covers and their 192 px backdrops fit after the LRU trim.
+/// The album page and Now Playing retain their own references to displayed images.
+const LARGE_BUDGET: usize = 16 << 20;
 /// Thumbnail requests kept waiting at most; older ones were scrolled past.
 const MAX_WAITING: usize = 160;
 const WORKERS: usize = 3;
@@ -147,7 +148,7 @@ pub fn init(art: ArtCache) {
                         None => image::open(&job.path),
                     };
                     let decoded = opened.ok().map(|img| {
-                        let rgb = img.to_rgb8();
+                        let rgb = img.into_rgb8();
                         SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(rgb.as_raw(), rgb.width(), rgb.height())
                     });
                     #[cfg(feature = "bench")]

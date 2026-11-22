@@ -11,7 +11,7 @@
 //! The analysis: a Hann-windowed FFT of the newest audible samples (8192 points at 44.1
 //! and 48 kHz, more at higher rates, so the low bars are as fine at every rate), bars on a
 //! logarithmic scale from 30 Hz to 16 kHz, each the loudest bin in its band (bands
-//! narrower than a bin are interpolated), in dB (a full-scale sine reads 0 dB) tilted
+//! narrower than a bin are measured at their centres), in dB (a full-scale sine reads 0 dB) tilted
 //! +3 dB per octave around 1 kHz (music falls off about that fast, so without it the
 //! treble would hardly move), mapped from `min_db..max_db` to 0..1. Each bar rises fast
 //! and falls smoothly; a peak cap holds a moment above it, then drops.
@@ -141,7 +141,7 @@ impl Tap {
     }
 }
 
-/// A radix-2 complex FFT of one size, in place.
+/// A real-input spectrum, computed in place with a half-length complex FFT.
 struct Fft {
     n: usize,
     twiddles: Vec<(f32, f32)>,
@@ -150,44 +150,59 @@ struct Fft {
 
 impl Fft {
     fn new(n: usize) -> Self {
-        assert!(n.is_power_of_two() && n >= 2);
-        let bits = n.trailing_zeros();
+        assert!(n.is_power_of_two() && n >= 4);
+        let bits = (n / 2).trailing_zeros();
         let twiddles = (0..n / 2)
             .map(|k| {
                 let a = -2.0 * std::f64::consts::PI * k as f64 / n as f64;
                 (a.cos() as f32, a.sin() as f32)
             })
             .collect();
-        let rev = (0..n as u32).map(|i| i.reverse_bits() >> (32 - bits)).collect();
+        let rev = (0..(n / 2) as u32).map(|i| i.reverse_bits() >> (32 - bits)).collect();
         Self { n, twiddles, rev }
     }
 
-    fn run(&self, re: &mut [f32], im: &mut [f32]) {
-        let n = self.n;
-        for i in 0..n {
-            let j = self.rev[i] as usize;
+    /// Pack even and odd samples into one complex transform, then recover the positive
+    /// frequency bins as interleaved real and imaginary components (Nyquist omitted).
+    fn run(&self, samples: &mut [f32]) {
+        debug_assert_eq!(samples.len(), self.n);
+        let x = samples.as_chunks_mut::<2>().0;
+        for (i, &j) in self.rev.iter().enumerate() {
+            let j = j as usize;
             if j > i {
-                re.swap(i, j);
-                im.swap(i, j);
+                x.swap(i, j);
             }
         }
         let mut len = 2;
-        while len <= n {
+        while len <= x.len() {
             let half = len / 2;
-            let step = n / len;
-            for start in (0..n).step_by(len) {
-                for k in 0..half {
+            let step = self.n / len;
+            for group in x.chunks_exact_mut(len) {
+                let (left, right) = group.split_at_mut(half);
+                for (k, (a, b)) in left.iter_mut().zip(right).enumerate() {
                     let (wr, wi) = self.twiddles[k * step];
-                    let (a, b) = (start + k, start + k + half);
-                    let tr = re[b] * wr - im[b] * wi;
-                    let ti = re[b] * wi + im[b] * wr;
-                    re[b] = re[a] - tr;
-                    im[b] = im[a] - ti;
-                    re[a] += tr;
-                    im[a] += ti;
+                    let tr = b[0] * wr - b[1] * wi;
+                    let ti = b[0] * wi + b[1] * wr;
+                    *b = [a[0] - tr, a[1] - ti];
+                    *a = [a[0] + tr, a[1] + ti];
                 }
             }
             len *= 2;
+        }
+        x[0] = [x[0][0] + x[0][1], 0.0];
+        let middle = x.len() / 2;
+        x[middle][1] = -x[middle][1]; // This bin is its own mirror.
+        for k in 1..middle {
+            let mirror = x.len() - k;
+            let ([a, b], [c, d]) = (x[k], x[mirror]);
+            // The even and odd sequences' spectra, split using their conjugate symmetry.
+            let even = [(a + c) * 0.5, (b - d) * 0.5];
+            let odd = [(b + d) * 0.5, (c - a) * 0.5];
+            // The odd samples are one frame later than the even ones.
+            let (wr, wi) = self.twiddles[k];
+            let (r, i) = (wr * odd[0] - wi * odd[1], wr * odd[1] + wi * odd[0]);
+            x[k] = [even[0] + r, even[1] + i];
+            x[mirror] = [even[0] - r, i - even[1]];
         }
     }
 }
@@ -222,22 +237,23 @@ impl Default for Config {
 }
 
 /// Where each bar reads the spectrum: a range of bins, or (narrower than a bin) a
-/// fractional bin to interpolate at.
+/// fractional bin to measure directly.
 #[derive(Clone, Copy, Debug)]
 enum Band {
     Bins(usize, usize),
-    At(f32),
+    Narrow,
 }
 
 pub struct Analyzer {
     cfg: Config,
     fft: Option<Fft>,
     window: Vec<f32>,
-    re: Vec<f32>,
-    im: Vec<f32>,
+    workspace: Vec<f32>,
     /// What `bands` was made for: (bars, rate, fft size).
     layout: (usize, u32, usize),
     bands: Vec<(Band, f32)>,
+    /// Bar indices and Goertzel coefficients for the fractional-bin measurements.
+    narrow: Vec<(usize, f64)>,
     targets: Vec<f32>,
     /// Each bar's level before the clamp to 0..1, and the auto level's slide of the scale
     /// (a share of its span: 0.1 is 6 dB of a 60 dB scale).
@@ -256,10 +272,10 @@ impl Analyzer {
             cfg,
             fft: None,
             window: Vec::new(),
-            re: Vec::new(),
-            im: Vec::new(),
+            workspace: Vec::new(),
             layout: (0, 0, 0),
             bands: Vec::new(),
+            narrow: Vec::new(),
             targets: Vec::new(),
             raw: Vec::new(),
             slide: 0.0,
@@ -299,21 +315,27 @@ impl Analyzer {
             self.fft = Some(Fft::new(n));
             // Hann.
             self.window = (0..n).map(|i| 0.5 - 0.5 * (2.0 * std::f32::consts::PI * i as f32 / n as f32).cos()).collect();
-            self.re = vec![0.0; n];
-            self.im = vec![0.0; n];
+            self.workspace = vec![0.0; n];
         }
         if self.layout != (bars, rate, n) {
             self.layout = (bars, rate, n);
             let res = rate as f32 / n as f32;
             let lo = self.cfg.min_hz;
             let hi = self.cfg.max_hz.min(rate as f32 * 0.475);
+            self.narrow.clear();
             self.bands = (0..bars)
                 .map(|i| {
                     let f0 = lo * (hi / lo).powf(i as f32 / bars as f32);
                     let f1 = lo * (hi / lo).powf((i + 1) as f32 / bars as f32);
                     let centre = (f0 * f1).sqrt();
                     let (b0, b1) = ((f0 / res).ceil() as usize, (f1 / res).ceil() as usize);
-                    let band = if b1 > b0 { Band::Bins(b0, b1.min(n / 2)) } else { Band::At(centre / res) };
+                    let band = if b1 > b0 {
+                        Band::Bins(b0, b1.min(n / 2))
+                    } else {
+                        let c = 2.0 * (std::f64::consts::TAU * f64::from(centre / res) / n as f64).cos();
+                        self.narrow.push((i, c));
+                        Band::Narrow
+                    };
                     let tilt = self.cfg.tilt_db * (centre / 1000.0).log2();
                     (band, tilt)
                 })
@@ -328,43 +350,69 @@ impl Analyzer {
         }
     }
 
-    /// The instant level (0..1) of each of `bars` bars for these samples (mono, oldest
-    /// first, at least `fft_size(rate)` of them: the newest are used).
-    pub fn measure(&mut self, samples: &[f32], rate: u32, bars: usize) -> &[f32] {
-        self.prepare(bars, rate);
-        let fft = self.fft.as_ref().unwrap();
-        let n = fft.n;
-        let src = &samples[samples.len().saturating_sub(n)..];
+    /// Transform this window in place, saving the narrow bars' power before the FFT.
+    fn transform(&mut self, src: &[f32], norm: f32) {
+        let n = self.workspace.len();
         let pad = n - src.len();
-        for i in 0..n {
-            self.re[i] = if i < pad { 0.0 } else { src[i - pad] * self.window[i] };
-            self.im[i] = 0.0;
+        let (zeros, values) = self.workspace.split_at_mut(pad);
+        zeros.fill(0.0);
+        for ((out, sample), gain) in values.iter_mut().zip(src).zip(&self.window[pad..]) {
+            *out = sample * gain;
         }
-        // |X|² of a full-scale sine under a Hann window is (N/4)²: that is 0 dB.
-        let norm = 16.0 / (n as f32 * n as f32);
         // Bars narrower than a bin (the lowest ones): the spectrum at their centre, exactly
         // (Goertzel, in f64: the low frequencies need the precision). Interpolating between
         // bins would lose up to 3 dB of a tone between them. Before the FFT, which works
         // in place.
-        for (b, (band, _)) in self.bands.iter().enumerate() {
-            if let Band::At(x) = *band {
-                let c = 2.0 * (2.0 * std::f64::consts::PI * f64::from(x) / n as f64).cos();
-                let (mut s1, mut s2) = (0.0f64, 0.0f64);
-                for &v in &self.re {
-                    let s0 = f64::from(v) + c * s1 - s2;
-                    s2 = s1;
-                    s1 = s0;
+        for group in self.narrow.chunks(8) {
+            // Independent filters share an input, so the compiler can run them in SIMD lanes.
+            let mut coeff = [0.0; 8];
+            for (slot, &(_, c)) in coeff.iter_mut().zip(group) {
+                *slot = c;
+            }
+            let (mut s1, mut s2) = ([0.0; 8], [0.0; 8]);
+            for &v in &self.workspace {
+                for k in 0..8 {
+                    // The input and older state can be combined while the previous stage
+                    // finishes. Use an FMA only where the target supplies the instruction.
+                    let addend = f64::from(v) - s2[k];
+                    let s0 = if cfg!(any(target_arch = "aarch64", target_feature = "fma")) {
+                        coeff[k].mul_add(s1[k], addend)
+                    } else {
+                        coeff[k] * s1[k] + addend
+                    };
+                    s2[k] = s1[k];
+                    s1[k] = s0;
                 }
-                self.targets[b] = ((s1 * s1 + s2 * s2 - c * s1 * s2) as f32) * norm;
+            }
+            for (k, &(bar, c)) in group.iter().enumerate() {
+                self.targets[bar] = ((s1[k] * s1[k] + s2[k] * s2[k] - c * s1[k] * s2[k]) as f32) * norm;
             }
         }
-        fft.run(&mut self.re, &mut self.im);
-        let power = |re: &[f32], im: &[f32], k: usize| (re[k] * re[k] + im[k] * im[k]) * norm;
+        self.fft.as_ref().unwrap().run(&mut self.workspace);
+    }
+
+    /// The instant level (0..1) of each of `bars` bars for these samples (mono, oldest
+    /// first, at least `fft_size(rate)` of them: the newest are used).
+    pub fn measure(&mut self, samples: &[f32], rate: u32, bars: usize) -> &[f32] {
+        self.prepare(bars, rate);
+        let n = self.workspace.len();
+        let src = &samples[samples.len().saturating_sub(n)..];
+        // |X|² of a full-scale sine under a Hann window is (N/4)²: that is 0 dB.
+        let norm = 16.0 / (n as f32 * n as f32);
+        let silent = src.iter().all(|&s| s == 0.0);
+        if !silent {
+            self.transform(src, norm);
+        }
+        let power = |k: usize| {
+            let [r, i] = self.workspace.as_chunks::<2>().0[k];
+            (r * r + i * i) * norm
+        };
         let (lo_db, span) = (self.cfg.min_db, self.cfg.max_db - self.cfg.min_db);
         for (b, (band, tilt)) in self.bands.iter().enumerate() {
             let p = match *band {
-                Band::Bins(a, z) => (a..z.max(a + 1).min(n / 2)).map(|k| power(&self.re, &self.im, k)).fold(0.0f32, f32::max),
-                Band::At(_) => self.targets[b],
+                _ if silent => 0.0,
+                Band::Bins(a, z) => (a..z.max(a + 1).min(n / 2)).map(power).fold(0.0f32, f32::max),
+                Band::Narrow => self.targets[b],
             };
             let db = 10.0 * p.max(1e-12).log10() + tilt;
             self.raw[b] = (db - lo_db) / span;
@@ -414,12 +462,12 @@ impl Analyzer {
     /// decide) are brought toward 0.75, the scale sliding up within a quarter of a second
     /// and down over two and a half; never lifting what is nearly silent.
     fn follow_level(&mut self, dt: f32) {
-        let mut v: Vec<f32> = self.raw.clone();
-        if v.is_empty() {
+        if self.raw.is_empty() {
             return;
         }
-        v.sort_by(f32::total_cmp);
-        let reference = v[((v.len() - 1) as f32 * 0.85) as usize];
+        self.targets.copy_from_slice(&self.raw);
+        let index = ((self.raw.len() - 1) as f32 * 0.85) as usize;
+        let reference = *self.targets.select_nth_unstable_by(index, f32::total_cmp).1;
         // Nearly silent (below the scale's foot): hold the slide where it is.
         if reference > 0.05 {
             let want = (reference - 0.75).clamp(-0.25, 0.2);
@@ -494,16 +542,38 @@ mod tests {
         let n = 64;
         let f = Fft::new(n);
         let x: Vec<f32> = (0..n).map(|i| ((i * 7 % 13) as f32 - 6.0) / 6.0).collect();
-        let (mut re, mut im) = (x.clone(), vec![0.0; n]);
-        f.run(&mut re, &mut im);
-        for k in 0..n {
+        let mut spectrum = x.clone();
+        f.run(&mut spectrum);
+        for (k, [re, im]) in spectrum.as_chunks::<2>().0.iter().enumerate() {
             let (mut r, mut i) = (0.0f64, 0.0f64);
             for (t, v) in x.iter().enumerate() {
                 let a = -2.0 * std::f64::consts::PI * (k * t) as f64 / n as f64;
                 r += f64::from(*v) * a.cos();
                 i += f64::from(*v) * a.sin();
             }
-            assert!((f64::from(re[k]) - r).abs() < 1e-3 && (f64::from(im[k]) - i).abs() < 1e-3, "bin {k}");
+            assert!((f64::from(*re) - r).abs() < 1e-3 && (f64::from(*im) - i).abs() < 1e-3, "bin {k}");
+        }
+    }
+
+    #[test]
+    fn narrow_bars_match_the_direct_dft_at_their_centres() {
+        let (rate, bars) = (48_000, 216);
+        let samples = pinkish(0.5, Analyzer::fft_size(rate));
+        let mut a = Analyzer::new(flat());
+        a.measure(&samples, rate, bars);
+        let centres = a.centres(bars);
+        assert!(a.narrow.len() > 8); // Exercise more than one batch.
+        for &(bar, _) in &a.narrow {
+            let step = std::f64::consts::TAU * f64::from(centres[bar]) / f64::from(rate);
+            let (mut re, mut im) = (0.0, 0.0);
+            for (i, (&s, &w)) in samples.iter().zip(&a.window).enumerate() {
+                let (sin, cos) = (step * i as f64).sin_cos();
+                re += f64::from(s * w) * cos;
+                im += f64::from(s * w) * sin;
+            }
+            let db = 20.0 * (re.hypot(im) * 4.0 / samples.len() as f64).log10() as f32;
+            let want = ((db - a.cfg.min_db) / (a.cfg.max_db - a.cfg.min_db)).clamp(0.0, 1.0);
+            assert!((a.targets[bar] - want).abs() < 1e-4, "bar {bar}: {} vs {want}", a.targets[bar]);
         }
     }
 
@@ -550,6 +620,9 @@ mod tests {
     #[test]
     fn silence_is_flat() {
         let mut a = Analyzer::new(Config::default());
+        // Silence immediately after music must discard both FFT and narrow-band power.
+        let signal = pinkish(0.8, 8192);
+        assert!(a.measure(&signal, 48_000, 80).iter().any(|&v| v > 0.0));
         let l = a.measure(&vec![0.0; 8192], 48_000, 80);
         assert!(l.iter().all(|&v| v == 0.0));
         // Very quiet noise (-90 dBFS) is below the scale too.

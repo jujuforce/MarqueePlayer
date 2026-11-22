@@ -108,7 +108,8 @@ fn mean_level() -> f32 {
 
 fn state_line(app: &AppWindow) -> String {
     let (timer, tap) = crate::visualizer::running();
-    format!("timer {timer}, tap {tap}, drawing {}", app.global::<Visualizer>().get_active())
+    let viz = app.global::<Visualizer>();
+    format!("timer {timer}, tap {tap}, drawing {}, native underlay {}", viz.get_active(), viz.get_native_underlay())
 }
 
 fn lyrics_line(app: &AppWindow) -> String {
@@ -403,6 +404,49 @@ pub fn run() {
     run_steps(steps);
 }
 
+/// Sample the same 30-second FLAC after each view settles. Keeping one process
+/// also measures what survives closing the window after it has actually drawn.
+pub fn playback_cost() {
+    let report: Report = Rc::default();
+    let start = Rc::new(RefCell::new((Instant::now(), Duration::ZERO, 0.0)));
+    let mut steps: Vec<Step> = Vec::new();
+    for (name, page) in [("Home", Some(Page::Home)), ("Now Playing", Some(Page::NowPlaying)), ("Hidden", None), ("Home restored", Some(Page::Home))] {
+        steps.push((0, Box::new(move |st, app| {
+            if let Some(page) = page {
+                app.show().expect("show benchmark window");
+                views::go(st, page);
+            } else {
+                app.hide().expect("hide benchmark window");
+            }
+            playback::play_tracks(st, album_tracks(st, "Spectrum"), 3);
+        })));
+        let begin = start.clone();
+        steps.push((3000, Box::new(move |st, _| {
+            *begin.borrow_mut() = (Instant::now(), cpu_time(), st.player.status().position);
+        })));
+        let (begin, r) = (start.clone(), report.clone());
+        steps.push((10_000, Box::new(move |st, app| {
+            let (at, cpu, position) = *begin.borrow();
+            let wall = at.elapsed().as_secs_f64();
+            let percent = (cpu_time() - cpu).as_secs_f64() * 100.0 / wall;
+            let (mem, peak, _) = crate::platform::system::resources();
+            let status = st.player.status();
+            let played = status.position - position;
+            let mut text = r.borrow_mut();
+            text.push_str(&format!("{name}: CPU {percent:.2}% of one core, memory {mem:.1} MiB, peak {peak:.1} MiB, {wall:.1} s\n"));
+            crate::bench::verdict(&mut text, "audio advanced throughout the sample", (played - wall).abs() < 1.0, format!("{played:.1} s"));
+            if page == Some(Page::NowPlaying) {
+                crate::bench::verdict(&mut text, "visualizer running", app.global::<Visualizer>().get_active(), state_line(app));
+            }
+        })));
+    }
+    steps.push((0, Box::new(move |_, _| {
+        write_report("playback-cost", &report.borrow());
+        let _ = slint::quit_event_loop();
+    })));
+    run_steps(steps);
+}
+
 pub fn run_idle() {
     let viz: u64 = std::env::var("MP_BENCH_VIZ_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(20);
     let idle: u64 = std::env::var("MP_BENCH_IDLE_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(60);
@@ -410,12 +454,23 @@ pub fn run_idle() {
     let begin = Instant::now();
     let unix = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64());
     let c0 = Rc::new(RefCell::new(Duration::ZERO));
+    let visible_start = Rc::new(RefCell::new(None));
     let mut steps: Vec<Step> = Vec::new();
     {
-        let (r, c0) = (r.clone(), c0.clone());
         steps.push((500, Box::new(move |st, _| {
-            playback::play_tracks(st, album_tracks(st, "Spectrum"), 3);
+            // An isolated copy can exercise the library, artwork and queue layout
+            // from an actual playback session without touching its listening history.
+            if std::env::var("MP_BENCH_SAVED_QUEUE").as_deref() == Ok("1") && crate::paths::Paths::overridden() {
+                playback::play_current(st);
+            } else {
+                playback::play_tracks(st, album_tracks(st, "Spectrum"), 3);
+            }
             views::go(st, Page::NowPlaying);
+        })));
+        let (r, c0, start) = (r.clone(), c0.clone(), visible_start.clone());
+        steps.push((3000, Box::new(move |st, _| {
+            let s = st.player.status();
+            *start.borrow_mut() = Some((Instant::now(), s.token, s.position));
             *c0.borrow_mut() = cpu_time();
             crate::visualizer::record(true);
             line(&r, format!("phase running: starts at unix {:.1}, pid {}", unix(), std::process::id()));
@@ -425,10 +480,31 @@ pub fn run_idle() {
         let (r, c0) = (r.clone(), c0.clone());
         steps.push((viz * 1000, Box::new(move |st, app| {
             let stats = crate::visualizer::take_stats();
-            let wall = stats.last().zip(stats.first()).map_or(Duration::from_secs(1), |(l, f)| l.0 - f.0);
-            line(&r, frame_report("visualizer running, playing, now playing shown", &stats, cpu_time() - *c0.borrow(), wall));
+            let (start, token, position) = visible_start.borrow().expect("visible sample started");
+            let wall = start.elapsed();
+            line(&r, frame_report("visualizer updates, playing, now playing shown", &stats, cpu_time() - *c0.borrow(), wall));
+            let status = st.player.status();
+            let (memory, _, _) = crate::platform::system::resources();
+            line(&r, format!("memory {memory:.1} MiB; {} queued; {}", st.queue.borrow().items().len(), state_line(app)));
+            let advanced = status.state == player_core::PlayState::Playing
+                && (status.token != token || (status.position - position - wall.as_secs_f64()).abs() < 1.0);
+            crate::bench::verdict(&mut r.borrow_mut(), "audio advanced through the sample", advanced, format!("position {:.1} s", status.position));
+            crate::ticker::occluded(true);
+        })));
+    }
+    {
+        let r = r.clone();
+        steps.push((600, Box::new(move |_, app| {
+            crate::bench::verdict(&mut r.borrow_mut(), "fully covering Now playing stops the visualizer", crate::visualizer::running() == (false, false), state_line(app));
+            crate::ticker::occluded(false);
+        })));
+    }
+    {
+        let r = r.clone();
+        steps.push((600, Box::new(move |st, app| {
+            let enabled = st.settings.borrow().visualizer;
+            crate::bench::verdict(&mut r.borrow_mut(), "revealing Now playing respects the visualizer setting", crate::visualizer::running() == (enabled, enabled), state_line(app));
             playback::set_paused(st, true);
-            let _ = app;
         })));
     }
     {

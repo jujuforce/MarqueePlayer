@@ -51,6 +51,9 @@ component CoverRow inherits Rectangle {
     in property <length> size: Theme.cover-size;
     private property <length> gap: 24px;
     private property <length> content-w: albums.length * (size + gap) - gap;
+    // Leave one extra tile at either edge for shadows and the next scroll step.
+    private property <int> first: clamp(floor(-flick.content-x / (size + gap)) - 1, 0, albums.length);
+    private property <int> past-last: clamp(ceil((self.width - flick.content-x) / (size + gap)) + 1, first, albums.length);
     private property <int> cursor;
     private property <int> at: min(root.cursor, root.albums.length - 1);
     height: header.height + 12px + size + 50px;
@@ -138,17 +141,17 @@ component CoverRow inherits Rectangle {
             content-width: max(root.width, root.content-w);
             // Not while autoscrolling: each frame's step would animate.
             animate content-x { duration: flick.autoscrolling ? 0ms : 300ms; easing: ease-out; }
-            for album[i] in root.albums: AlbumTile {
-                x: i * (root.size + root.gap);
+            for slot in root.past-last - root.first: AlbumTile {
+                index: root.first + slot;
+                x: self.index * (root.size + root.gap);
                 // Room for the focus ring and the hover lift.
                 y: 4px;
                 size: root.size;
-                album: album;
-                index: i;
-                focused: fs.has-focus && i == root.at;
-                open => { Actions.open-album(album.id); }
-                play => { Actions.play-album(album.id); }
-                open-artist => { Actions.open-artist(album.artist); }
+                album: root.albums[self.index];
+                focused: fs.has-focus && self.index == root.at;
+                open => { Actions.open-album(self.album.id); }
+                play => { Actions.play-album(self.album.id); }
+                open-artist => { Actions.open-artist(self.album.artist); }
             }
         }
     }
@@ -199,7 +202,6 @@ component HeroShelf inherits Rectangle {
     private property <int> cursor: root.shelf.hero;
     private property <length> thumb: 52px;
     private property <length> thumb-gap: 8px;
-    height: 300px;
     card := Rectangle {
         border-radius: Theme.radius-card;
         clip: true;
@@ -316,16 +318,15 @@ component HeroShelf inherits Rectangle {
                             reject
                         }
                         focus-gained => { Focus.zone = ""; root.cursor = root.shelf.hero; }
-                        for a[i] in root.shelf.albums: HeroThumb {
+                        for i in min(root.shelf.albums.length, floor((strip-fs.width + root.thumb-gap) / (root.thumb + root.thumb-gap))): HeroThumb {
                             x: i * (root.thumb + root.thumb-gap);
-                            visible: self.x + root.thumb <= strip-fs.width;
                             size: root.thumb;
-                            album: a;
+                            album: root.shelf.albums[i];
                             current: i == root.shelf.hero;
                             cursor: strip-fs.has-focus && i == root.cursor;
                             clicked => { Actions.hero-select(root.shelf.index, i); }
                             // The first click featured it; the second plays it.
-                            double-clicked => { Actions.play-album(a.id); }
+                            double-clicked => { Actions.play-album(self.album.id); }
                         }
                     }
                 }
@@ -431,7 +432,7 @@ export component HomePage inherits Rectangle {
                 }
             }
             for shelf in Home.shelves: Rectangle {
-                height: shelf.layout == ShelfLayout.row ? r.height : shelf.layout == ShelfLayout.grid ? g.height + 48px : h.height;
+                height: shelf.layout == ShelfLayout.row ? r.height : shelf.layout == ShelfLayout.grid ? g.height + 48px : 300px;
                 r := CoverRow {
                     visible: shelf.layout == ShelfLayout.row;
                     title: shelf.title;
@@ -466,8 +467,7 @@ export component HomePage inherits Rectangle {
                     albums: shelf.layout == ShelfLayout.grid ? shelf.albums : [];
                     columns(n) => { if shelf.layout == ShelfLayout.grid { Actions.home-grid-columns(n); } }
                 }
-                h := HeroShelf {
-                    visible: shelf.layout == ShelfLayout.hero;
+                if shelf.layout == ShelfLayout.hero: HeroShelf {
                     shelf: shelf;
                 }
             }

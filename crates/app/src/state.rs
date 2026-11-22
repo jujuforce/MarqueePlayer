@@ -106,7 +106,7 @@ pub struct State {
     pub art: ArtCache,
     pub player: Player,
     pub events: crossbeam_channel::Receiver<player_core::Event>,
-    pub queue: RefCell<Queue>,
+    pub queue: Rc<RefCell<Queue>>,
     /// Engine token -> queue item uid: the tokens the engine may still report (`new_token`,
     /// `tracks_started`).
     pub tokens: RefCell<HashMap<u64, u64>>,

@@ -26,6 +26,8 @@
 pub(crate) mod beat;
 pub(crate) mod draw;
 pub(crate) mod look;
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
 pub(crate) mod presets;
 pub(crate) mod share;
 
@@ -74,7 +76,6 @@ pub enum Where {
 }
 
 /// What the brushes were made for: rebuilt when any of it changes.
-#[derive(Clone, PartialEq)]
 struct BrushKey {
     look: Look,
     stage: Stage,
@@ -86,6 +87,8 @@ struct BrushKey {
 }
 
 struct Viz {
+    #[cfg(target_os = "macos")]
+    native: macos::Presenter,
     timer: Timer,
     tap: Arc<Tap>,
     analyzer: Analyzer,
@@ -111,6 +114,8 @@ thread_local! {
 pub fn install(st: &Rc<State>) {
     VIZ.with(|v| {
         *v.borrow_mut() = Some(Viz {
+            #[cfg(target_os = "macos")]
+            native: macos::Presenter::default(),
             timer: Timer::default(),
             tap: st.player.spectrum(),
             analyzer: Analyzer::new(Config::default()),
@@ -166,6 +171,11 @@ pub fn settings(st: &State) -> VizSettings {
     })
 }
 
+/// The placement can be checked on each frame without copying the saved colour palette.
+fn placement(st: &State) -> Placement {
+    st.settings.borrow().visualizer_look.as_ref().map_or(Placement::Behind, |s| s.placement)
+}
+
 fn theme_viz(app: &AppWindow) -> ThemeViz {
     let t = app.global::<Theme>();
     ThemeViz {
@@ -181,16 +191,21 @@ fn theme_viz(app: &AppWindow) -> ThemeViz {
 
 /// The look in effect.
 fn look(st: &State, app: &AppWindow) -> Look {
-    settings(st).effective(&theme_viz(app))
+    let theme = theme_viz(app);
+    match &st.settings.borrow().visualizer_look {
+        Some(s) => s.effective(&theme),
+        None if reduced() => Preset::Calm.look(&theme),
+        None => Look::classic(&theme),
+    }
 }
 
 /// The look drawn on a stage: the one in effect, or on Settings' preview a pasted or
 /// imported preset waiting for the user's yes (`presets::trial`).
 fn drawn(st: &State, app: &AppWindow, at: Option<Where>) -> Look {
-    match (at, crate::visualizer::presets::trial_look()) {
-        (Some(Where::Preview), Some(l)) => l,
-        _ => look(st, app),
+    if at == Some(Where::Preview) && let Some(trial) = crate::visualizer::presets::trial_look() {
+        return trial;
     }
+    look(st, app)
 }
 
 pub(crate) fn theme(app: &AppWindow) -> ThemeViz {
@@ -570,7 +585,7 @@ fn stage(st: &State, app: &AppWindow) -> Option<Where> {
         return None;
     }
     match app.global::<Nav>().get_page() {
-        Page::NowPlaying if st.settings.borrow().visualizer => match settings(st).placement {
+        Page::NowPlaying if st.settings.borrow().visualizer => match placement(st) {
             Placement::Behind => Some(Where::Behind),
             Placement::Panel => app.global::<Visualizer>().get_tab().then_some(Where::Panel),
             Placement::Page => Some(Where::Page),
@@ -602,7 +617,7 @@ pub fn wake(st: &Rc<State>) {
     let Some(app) = st.app.upgrade() else { return };
     let at = stage(st, &app);
     // A preset waiting in the preview goes with the preview.
-    if at != Some(Where::Preview) && crate::visualizer::presets::trial_look().is_some() {
+    if at != Some(Where::Preview) && crate::visualizer::presets::trial_look().is_some() && !shown(st) {
         crate::visualizer::presets::drop_trial(st);
     }
     let play = playing(st);
@@ -616,6 +631,8 @@ pub fn wake(st: &Rc<State>) {
                 z.last = None;
                 let refresh = app.window().with_winit_window(|w| w.current_monitor().and_then(|m| m.refresh_rate_millihertz())).flatten().map(|mhz| (mhz + 500) / 1000);
                 let every = look::frame_interval(settings(st).fps, refresh);
+                #[cfg(target_os = "macos")]
+                { z.native.display_interval = every; }
                 z.timer.start(TimerMode::Repeated, every, || state::with(frame).unwrap_or(()));
             }
             Some(Where::Preview) if !play && !z.timer.running() => still = true,
@@ -629,9 +646,19 @@ pub fn wake(st: &Rc<State>) {
     if still {
         still_frame(st, &app);
     }
+    // A menu or an unpinned sidebar may open between spectrum samples. Hand the
+    // complete scene to Skia before the overlay draws a backdrop filter over it.
+    #[cfg(target_os = "macos")]
+    if at.is_some() && app.global::<Visualizer>().get_native_underlay()
+        && app.global::<Theme>().get_glass() && !app.get_viz_fixed_glass()
+    {
+        frame(st);
+    }
 }
 
 fn stop(z: &mut Viz, app: &AppWindow) {
+    #[cfg(target_os = "macos")]
+    z.native.remove(app);
     z.timer.stop();
     z.tap.set_active(false);
     z.analyzer.reset();
@@ -711,18 +738,22 @@ fn stage_of(app: &AppWindow) -> Stage {
 }
 
 /// The brushes for this frame, rebuilt when what they depend on changed.
-fn brush(z: &mut Viz, app: &AppWindow, l: &Look, s: &Stage, at: Where, behind: bool) {
+fn brush(z: &mut Viz, app: &AppWindow, l: &Look, s: &Stage, at: Where, behind: bool) -> bool {
     let accent = rgb(app.global::<Theme>().get_accent());
     let alpha = l.strength(at == Where::Behind || (at == Where::Preview && behind));
-    let key = BrushKey { look: l.clone(), stage: *s, top: z.draw.paths.top_h, refl: z.draw.paths.refl_h, accent, palette: z.palette.clone(), alpha };
-    if z.brushes.as_ref() == Some(&key) {
-        return;
+    let (top, refl) = (z.draw.paths.top_h, z.draw.paths.refl_h);
+    if z.brushes.as_ref().is_some_and(|key|
+        &key.look == l && &key.stage == s && key.top == top && key.refl == refl
+            && key.accent == accent && key.palette == z.palette && key.alpha == alpha)
+    {
+        return false;
     }
     let stops = draw::base_stops(l, accent, &z.palette);
-    let b = draw::brushes(l, s, key.top, key.refl, &stops, alpha);
+    let b = draw::brushes(l, s, top, refl, &stops, alpha);
     set_brushes(&app.global::<Visualizer>(), &b);
     app.global::<Visualizer>().set_crisp(draw::crisp(l));
-    z.brushes = Some(key);
+    z.brushes = Some(BrushKey { look: l.clone(), stage: *s, top, refl, accent, palette: z.palette.clone(), alpha });
+    true
 }
 
 /// The look, the colours or the theme changed: redraw what is shown, running or not.
@@ -804,7 +835,6 @@ fn frame(st: &Rc<State>) {
     let Some(app) = st.app.upgrade() else { return };
     let at = stage(st, &app);
     let play = playing(st);
-    let s = settings(st);
     let l = drawn(st, &app, at);
     let sg = stage_of(&app);
     let mut back_to_still = false;
@@ -843,12 +873,17 @@ fn frame(st: &Rc<State>) {
             z.draw.pulse(draw::Pulse::default());
         }
         let g = app.global::<Visualizer>();
-        z.draw.tick(dt);
         match draw_mode() {
+            #[cfg(target_os = "macos")]
+            DrawMode::Full if macos::present(z, &app, &l, &sg, at, dt) => {}
             DrawMode::Full => {
-                let (lv, pk) = (z.analyzer.levels().to_vec(), z.analyzer.peaks().to_vec());
-                z.draw.draw(&l, &sg, true, &lv, &pk);
-                brush(z, &app, &l, &sg, at, s.placement == Placement::Behind);
+                #[cfg(target_os = "macos")]
+                z.native.restore_interval(&z.timer);
+                #[cfg(target_os = "macos")]
+                z.native.remove(&app);
+                z.draw.tick(dt);
+                z.draw.draw(&l, &sg, true, z.analyzer.levels(), z.analyzer.peaks());
+                brush(z, &app, &l, &sg, at, placement(st) == Placement::Behind);
                 set_paths(&g, &z.draw.paths);
                 // The ring's cover, a little larger for a moment with each beat.
                 let scale = if l.style.around() && l.cover_pulse { 1.0 + COVER_PULSE * z.draw.paths.punch.clamp(0.0, 1.0) } else { 1.0 };
@@ -929,6 +964,37 @@ pub fn menu(st: &Rc<State>, x: f32, y: f32, from_keys: bool) {
     let Some(app) = st.app.upgrade() else { return };
     let e = menu_entries(st, &app);
     crate::menus::show_plain(st, e, x, y, from_keys);
+}
+
+#[cfg(feature = "bench")]
+/// Inspect the actual presenter geometry for ring, particle and line assertions.
+pub fn effect_paths(app: &AppWindow) -> draw::Paths {
+    let g = app.global::<Visualizer>();
+    #[cfg(target_os = "macos")]
+    if g.get_native_underlay() {
+        return VIZ.with(|v| v.borrow().as_ref().map(|z| z.native.paths.as_svg()).unwrap_or_default());
+    }
+    draw::Paths {
+        line: g.get_line().to_string(), fill: g.get_fill().to_string(), caps: g.get_caps().to_string(),
+        refl: [g.get_refl0(), g.get_refl1(), g.get_refl2(), g.get_refl3(), g.get_refl4(), g.get_refl5()].map(|s| s.to_string()),
+        ripples: g.get_ripples().to_string(),
+        sparks: g.get_sparks().to_string(), sparks_old: g.get_sparks_old().to_string(),
+        sparks_glow: g.get_sparks_glow().to_string(), front: g.get_front().to_string(), front_glow: g.get_front_glow().to_string(),
+        top_h: g.get_top_h(), refl_h: g.get_refl_h(),
+        ..Default::default()
+    }
+}
+
+#[cfg(feature = "bench")]
+pub fn presented_cover_scale(app: &AppWindow) -> f32 {
+    let g = app.global::<Visualizer>();
+    #[cfg(target_os = "macos")]
+    if g.get_native_underlay() {
+        unsafe extern "C" { fn mp_spectrum_cover_scale() -> f32; }
+        // SAFETY: the bench samples the attached layer on the UI thread.
+        return unsafe { mp_spectrum_cover_scale() };
+    }
+    g.get_cover_scale()
 }
 
 #[cfg(feature = "bench")]

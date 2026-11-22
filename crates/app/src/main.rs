@@ -170,12 +170,7 @@ fn run() {
     covers::init(art.clone());
 
     let glass = select_renderer();
-    let app = AppWindow::new().unwrap_or_else(|e| {
-        crash::fatal_at_start(&format!(
-            "Marquee Player could not open its window ({e}).\n\nThis is usually the graphics driver: updating it, or restarting the computer, often helps. The details are in the log:\n{}",
-            paths.log().display()
-        ))
-    });
+    let app = AppWindow::new().unwrap_or_else(|e| window_start_error(&e, &paths));
     app.global::<Theme>().set_glass_supported(glass);
     // Linux: no decorations from the system (Slint asks again for them whenever the window's
     // properties change, unless the window says `no-frame`).
@@ -205,6 +200,7 @@ fn run() {
     // The shared equalizer setting until the device is known (eq::install picks its own).
     engine.set_eq(&eq::params(&settings.equalizer.all));
 
+    let queue = Rc::new(RefCell::default());
     let st = Rc::new(State {
         app: app.as_weak(),
         paths: paths.clone(),
@@ -216,7 +212,7 @@ fn run() {
         art,
         player: engine,
         events,
-        queue: RefCell::default(),
+        queue: queue.clone(),
         tokens: RefCell::default(),
         next_token: Cell::new(0),
         requested_next: Cell::new(None),
@@ -241,7 +237,7 @@ fn run() {
             search_albums: AlbumModel::new(Vec::new()),
             artists: AlbumModel::new(Vec::new()),
             groups: AlbumModel::new(Vec::new()),
-            queue: QueueModel::new(),
+            queue: QueueModel::new(queue),
         },
         open_album: Cell::new(None),
         open_playlist: Cell::new(None),
@@ -313,6 +309,10 @@ fn run() {
     // files among them are imported).
     if !open_args.is_empty() {
         opener::open_given(&st, open_args, opener::Mode::Play);
+    } else if std::env::args_os().skip(1).any(|a| a == "--resume-playback") && st.queue.borrow().current().is_some() {
+        // Start an explicitly requested listening session at its saved position.
+        views::go(&st, Page::NowPlaying);
+        playback::play_current(&st);
     }
 
     // Scan on start (incremental: fast when nothing changed), then watch.
@@ -345,9 +345,7 @@ fn run() {
     let saved = st.settings.borrow().window;
     placement::before_show(&app, saved);
     if let Err(e) = app.show() {
-        crash::fatal_at_start(&format!(
-            "Marquee Player could not show its window ({e}).\n\nThis is usually the graphics driver: updating it, or restarting the computer, often helps."
-        ));
+        window_start_error(&e, &paths);
     }
     // "Start with Windows" starts it in the tray: the window is made (so a second launch
     // and the tray find it) but not shown. Only with a tray to come back from.
@@ -550,45 +548,50 @@ pub fn toggle_visualizer(st: &Rc<State>) {
     visualizer::wake(st);
 }
 
-/// Skia draws `backdrop-blur` (live frosted glass); the software renderer is the fallback
-/// and cannot. The renderers are tried in the system's order (`platform::system::RENDERERS`).
+/// Skia draws `backdrop-blur` (live frosted glass). Software draws the pre-blurred art.
+/// The renderers are tried in the system's order (`platform::system::RENDERERS`).
 /// Windows: Skia through wgpu (Direct3D 12), not OpenGL: on AMD's OpenGL driver some of
 /// Skia's dual-source-blend shaders fail to link ("all must have location qualifiers"),
 /// and the draws that need them, the backdrop blur of a moving panel among them, are
 /// silently dropped. Linux: Skia through wgpu (Vulkan), else Skia on OpenGL (EGL or GLX:
-/// GPUs and drivers without Vulkan), else software. macOS: Skia on Metal, else software.
+/// GPUs and drivers without Vulkan), else software. macOS tries Skia on Metal first,
+/// then retained software tiles on Core Animation.
 /// Returns whether glass is available.
 /// `SLINT_BACKEND` still wins when set (`winit-skia-opengl` for the frame-timing bench,
 /// whose rendering notifier the wgpu surface does not call; on Windows that renderer is
 /// only in builds with the `bench-opengl` feature).
 fn select_renderer() -> bool {
     if let Ok(forced) = std::env::var("SLINT_BACKEND") {
-        if forced.contains("skia-opengl") && !cfg!(feature = "bench-opengl") && !platform::system::HAS_SKIA_OPENGL {
-            log::warn!("SLINT_BACKEND={forced}: this build has no Skia OpenGL renderer (build with --features bench-opengl)");
-        }
-        if platform::devwindow::enabled() {
-            // Same backend and renderer, through the selector so the placement applies
-            // ("winit-skia-opengl": backend "winit", renderer "skia-opengl").
-            let (backend, renderer) = forced.split_once('-').unwrap_or((forced.as_str(), ""));
-            let mut s = slint::BackendSelector::new()
-                .backend_name(backend.into())
-                .with_winit_window_attributes_hook(platform::devwindow::attributes);
-            if !renderer.is_empty() {
-                s = s.renderer_name(renderer.into());
-            }
-            if let Err(e) = s.select() {
-                log::warn!("MP_WINDOW with SLINT_BACKEND={forced}: {e}");
+        // Keep the native window chrome and the bench placement with an explicit backend too.
+        let lower = forced.to_lowercase();
+        if lower == "winit-skia-opengl" && !cfg!(feature = "bench-opengl") && !platform::system::HAS_SKIA_OPENGL {
+            log::warn!("SLINT_BACKEND={forced}: this build has no Skia OpenGL renderer");
+        } else {
+            match platform::explicit_renderer(selector(), &lower).select() {
+                Ok(()) => {
+                    platform::configure_renderer(lower.strip_prefix("winit-").unwrap_or(&lower));
+                    about::set_renderer(&format!("requested {forced}"));
+                    return lower.contains("skia") && !lower.contains("software");
+                }
+                Err(e) => log::warn!("SLINT_BACKEND={forced}: {e}; trying the platform defaults"),
             }
         }
-        about::set_renderer(&format!("SLINT_BACKEND={forced}"));
-        return forced.contains("skia") && !forced.contains("software");
     }
     let mut last = String::new();
     for (name, label) in platform::system::RENDERERS {
-        match selector().renderer_name((*name).into()).select() {
+        #[cfg(target_os = "macos")]
+        if *name == "skia" && !platform::system::has_metal_device() {
+            continue;
+        }
+        #[cfg(target_os = "macos")]
+        let renderer = platform::explicit_renderer(selector(), &format!("winit-{name}"));
+        #[cfg(not(target_os = "macos"))]
+        let renderer = selector().renderer_name((*name).into());
+        match renderer.select() {
             Ok(()) => {
+                platform::configure_renderer(name);
                 about::set_renderer(label);
-                return true;
+                return name.contains("skia");
             }
             Err(e) => {
                 last = e.to_string();
@@ -596,10 +599,20 @@ fn select_renderer() -> bool {
             }
         }
     }
-    log::warn!("Skia renderer unavailable ({last}); software renderer, no live blur");
+    log::warn!("preferred renderers unavailable ({last}); trying software");
     let _ = selector().renderer_name("software".into()).select();
-    about::set_renderer("software renderer (Skia unavailable)");
+    platform::configure_renderer("software");
+    about::set_renderer("software renderer");
     false
+}
+
+// Some renderers create their device only when the window first opens.
+fn window_start_error(error: &slint::PlatformError, paths: &paths::Paths) -> ! {
+    let advice = std::env::var("SLINT_BACKEND").map_or_else(
+        |_| "Updating the graphics driver or restarting the computer may help.".to_owned(),
+        |forced| format!("Remove SLINT_BACKEND={forced} to use the default renderer."),
+    );
+    crash::fatal_at_start(&format!("Marquee Player could not open its window ({error}).\n\n{advice}\n\nLog: {}", paths.log().display()));
 }
 
 /// The winit backend, with the `MP_WINDOW=secondary` placement when asked for.
@@ -816,12 +829,26 @@ fn set_native_icon(app: &AppWindow) -> bool {
     platform::devwindow::maximize(hwnd as *mut std::ffi::c_void);
     // The saved interface size (if the window's first events have not applied it already).
     zoom::install(app);
-    log::info!("window hooks installed");
+    log::info!("window hooks installed; renderer: {}", about::renderer());
     true
 }
 
 /// Attach every UI callback.
 fn wire(app: &AppWindow) {
+    let weak = app.as_weak();
+    app.on_full_cover_changed(move |stem| {
+        let Some(app) = weak.upgrade() else { return };
+        app.global::<Player>().set_full(Default::default());
+        if !stem.is_empty() {
+            let weak = app.as_weak();
+            let wanted = stem.clone();
+            covers::with_image(&stem, covers::Kind::Full, move |img| {
+                if let Some(app) = weak.upgrade() && app.get_full_cover_stem() == wanted {
+                    app.global::<Player>().set_full(img);
+                }
+            });
+        }
+    });
     let chrome = app.global::<Chrome>();
     chrome.on_minimize(platform::window::minimize);
     chrome.on_toggle_maximize(platform::window::toggle_maximize);

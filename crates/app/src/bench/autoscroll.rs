@@ -730,14 +730,15 @@ pub fn run_tray() {
     };
     let spent = |c0: &Rc<Cell<Duration>>, w0: &Rc<Cell<Instant>>| {
         let cpu = cpu_time() - c0.get();
-        let busy = (cycles() - CY0.with(Cell::get)) as f64 / HZ.with(Cell::get);
         let wall = w0.get().elapsed().as_secs_f64();
-        format!(
-            "process CPU {:.1} ms by cycles ({:.0} ms by GetProcessTimes) in {wall:.1} s = {:.3}% of one core",
-            busy * 1000.0,
-            cpu.as_secs_f64() * 1000.0,
-            100.0 * busy / wall
-        )
+        let (memory, _, _) = crate::platform::system::resources();
+        let ms = cpu.as_secs_f64() * 1000.0;
+        if let Some(end) = crate::platform::system::cycles() {
+            let busy = (end - CY0.with(Cell::get)) as f64 / HZ.with(Cell::get);
+            format!("process CPU {:.1} ms by cycles ({ms:.0} ms by GetProcessTimes) in {wall:.1} s = {:.3}% of one core; memory {memory:.1} MiB", busy * 1000.0, 100.0 * busy / wall)
+        } else {
+            format!("process CPU {ms:.0} ms in {wall:.1} s = {:.3}% of one core; memory {memory:.1} MiB", 100.0 * cpu.as_secs_f64() / wall)
+        }
     };
 
     step!(500, move |st, app, r, _, c0, w0| {
@@ -801,7 +802,11 @@ pub fn run_tray() {
             line(r, format!("  {n} frames in {span:.1} s ({:.1} per s), {sent} icons sent; a frame takes p50 {:.3} ms, p95 {:.3}, max {:.3} (drawing)", n as f64 / span, pct(0.5), pct(0.95), pct(1.0)));
             let (gdi, user) = gui_objects();
             check(r, fails, "no GDI or USER objects leaked", gdi <= gdi0.get().0 + 2 && user <= gdi0.get().1 + 2, format!("GDI {} -> {gdi}, USER {} -> {user} over {sent} icons", gdi0.get().0, gdi0.get().1));
-            check(r, fails, "the bars move", sent > n / 3, format!("{sent} of {n}"));
+            if !crate::platform::system::TRAY_ANIMATES {
+                check(r, fails, "the static status item schedules no frames", n == 0, format!("{n} frames"));
+            } else {
+                check(r, fails, "the bars move", sent > n / 3, format!("{sent} of {n}"));
+            }
             // Contact sheets: 24 frames from the middle of the run.
             let from = n.saturating_sub(48);
             let frames: Vec<[f32; 5]> = stats[from..(from + 24).min(n)].iter().map(|s| s.3).collect();
@@ -822,8 +827,12 @@ pub fn run_tray() {
         let stats = crate::tray::anim::take_stats();
         let (run, sent, _) = crate::tray::anim::running();
         line(r, format!("[pause] {} frames after the pause: {:?}", stats.len(), stats.iter().map(|s| s.3.map(|v| v.round() as i32)).collect::<Vec<_>>()));
-        check(r, fails, "settles over a few frames, then the timer stops", !run && (2..=8).contains(&stats.len()), format!("timer {run}, icons sent {sent}"));
-        check(r, fails, "the last frame is the resting glyph", stats.last().is_some_and(|s| s.3 == crate::tray::icon::REST_HEIGHTS), String::new());
+        if !crate::platform::system::TRAY_ANIMATES {
+            check(r, fails, "the static status item stays at rest", stats.is_empty() && !run, format!("timer {run}"));
+        } else {
+            check(r, fails, "settles over a few frames, then the timer stops", !run && (2..=8).contains(&stats.len()), format!("timer {run}, icons sent {sent}"));
+            check(r, fails, "the last frame is the resting glyph", stats.last().is_some_and(|s| s.3 == crate::tray::icon::REST_HEIGHTS), String::new());
+        }
     });
     step!(500, move |st, _app, r, _, c0, w0| {
         begin(c0, w0);

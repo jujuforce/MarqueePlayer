@@ -5,7 +5,8 @@
 //! runs a tick on the UI thread for each one (`forward`). The timer is only for what
 //! moves by itself, and runs no more often than that needs:
 //!
-//! - playing, window shown: every 100 ms (the position, play counting);
+//! - playing, window shown: every 100 ms. On macOS the seek bar can tick once per pixel
+//!   (up to 500 ms), with the full rate for visible synced lyrics;
 //! - playing, window hidden, minimized or covered: every 500 ms (play counting, session saves);
 //! - not playing, window shown: once a second (window placement, saves);
 //! - not playing, hidden: not at all.
@@ -27,7 +28,7 @@ use std::time::{Duration, Instant};
 use player_core::{Event, PlayState};
 use slint::{ComponentHandle, Timer, TimerMode};
 
-use crate::{playback, state};
+use crate::{AppWindow, Lyrics, Nav, Page, Player, playback, state};
 
 const FAST: Duration = Duration::from_millis(100);
 const HIDDEN: Duration = Duration::from_millis(500);
@@ -125,24 +126,44 @@ fn set_interval(interval: Option<Duration>) {
 /// Pick the rate for what is going on now (see the module doc).
 fn reschedule() {
     let settling = FAST_UNTIL.with(|f| f.get().is_some_and(|t| Instant::now() < t));
-    let (playing, shown) = state::with(|st| {
-        let playing = st.player.status().state == PlayState::Playing;
-        // Minimized to the taskbar is still "visible" to the toolkit, but nothing shows.
-        let shown = st.app.upgrade().is_some_and(|a| shown(a.window()));
-        (playing, shown)
-    })
-    .unwrap_or((false, false));
-    set_interval(rate(settling, playing, shown));
+    let interval = state::with(|st| {
+        let app = st.app.upgrade()?;
+        rate(settling, st.player.status().state == PlayState::Playing, shown(app.window()), || visible_cadence(&app))
+    });
+    set_interval(interval.flatten());
 }
 
-/// How often to tick (the module doc's table); `None`: not at all. Counting the listening time
-/// goes by the wall clock between reports, not by the ticks, so a slower rate counts the same.
-fn rate(settling: bool, playing: bool, shown: bool) -> Option<Duration> {
+fn rate(settling: bool, playing: bool, shown: bool, visible_cadence: impl FnOnce() -> Duration) -> Option<Duration> {
     match (settling, playing, shown) {
-        (true, _, _) | (false, true, true) => Some(FAST),
+        (true, _, _) => Some(FAST),
+        (false, true, true) => Some(visible_cadence()),
         (false, true, false) => Some(HIDDEN),
         (false, false, true) => Some(SLOW),
         (false, false, false) => None,
+    }
+}
+
+fn visible_cadence(app: &AppWindow) -> Duration {
+    if !cfg!(target_os = "macos") {
+        return FAST;
+    }
+    let lyrics = app.global::<Lyrics>();
+    if app.global::<Nav>().get_page() == Page::NowPlaying && lyrics.get_shown() && lyrics.get_synced() {
+        FAST
+    } else if app.get_bar_visible() {
+        progress_interval(app.global::<Player>().get_duration(), app.get_seek_width())
+    } else {
+        HIDDEN
+    }
+}
+
+/// A logical pixel of travel is enough to show steady progress. The clock and
+/// listening count still update at least twice a second on a long track.
+fn progress_interval(seconds: f32, pixels: f32) -> Duration {
+    if seconds > 0.0 && pixels > 0.0 {
+        Duration::from_millis((1000.0 * seconds / pixels) as u64).clamp(FAST, HIDDEN)
+    } else {
+        HIDDEN
     }
 }
 
@@ -152,11 +173,20 @@ mod tests {
 
     #[test]
     fn a_window_not_shown_ticks_slowly() {
-        assert_eq!(rate(false, true, true), Some(FAST));
-        assert_eq!(rate(false, true, false), Some(HIDDEN));
-        assert_eq!(rate(false, false, true), Some(SLOW));
-        assert_eq!(rate(false, false, false), None);
-        assert_eq!(rate(true, false, false), Some(FAST));
+        let visible = || Duration::from_millis(250);
+        assert_eq!(rate(false, true, true, visible), Some(visible()));
+        assert_eq!(rate(false, true, false, visible), Some(HIDDEN));
+        assert_eq!(rate(false, false, true, visible), Some(SLOW));
+        assert_eq!(rate(false, false, false, visible), None);
+        assert_eq!(rate(true, false, false, visible), Some(FAST));
+    }
+
+    #[test]
+    fn progress_follows_the_width_and_duration() {
+        assert_eq!(progress_interval(180.0, 600.0), Duration::from_millis(300));
+        assert_eq!(progress_interval(6.0, 600.0), FAST);
+        assert_eq!(progress_interval(3600.0, 600.0), HIDDEN);
+        assert_eq!(progress_interval(0.0, 0.0), HIDDEN);
     }
 
     #[test]

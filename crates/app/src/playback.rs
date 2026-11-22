@@ -152,6 +152,7 @@ pub fn play_current(st: &Rc<State>) {
         crate::server::streaming::follow_queue(st);
         show_loading(st);
         refresh_now_playing(st);
+        refresh_queue(st);
         return;
     };
     crate::ticker::kick();
@@ -575,8 +576,7 @@ fn say_if_ended_early(st: &Rc<State>) {
 }
 
 /// Drain engine events and refresh position. Runs as each engine event arrives and on
-/// the ticker's timer (ticker.rs: 100 ms while playing, less often or not at all when
-/// nothing moves).
+/// the ticker's timer, paced to the visible playback controls (ticker.rs).
 pub fn tick(st: &Rc<State>) {
     crate::wakes::note(&crate::wakes::TICKS);
     while let Ok(ev) = st.events.try_recv() {
@@ -699,6 +699,7 @@ pub fn tick(st: &Rc<State>) {
     show_loading(st);
     let s = st.player.status();
     let Some(app) = st.app.upgrade() else { return };
+    app.set_window_shown(app.window().is_visible());
     let p = app.global::<Player>();
     // A server track not started yet shows as playing (pause pauses it) unless paused.
     p.set_playing(s.state == PlayState::Playing || (STARTING.with(Cell::get).is_some() && !st.player.is_paused()));
@@ -813,6 +814,7 @@ pub fn refresh_queue_tracks(st: &Rc<State>) {
     };
     let (any, current) = st.queue.borrow_mut().update_tracks(|id| fresh.get(&id).cloned());
     if any {
+        st.models.queue.invalidate();
         refresh_queue(st);
     }
     if current {
@@ -822,12 +824,17 @@ pub fn refresh_queue_tracks(st: &Rc<State>) {
 
 pub fn refresh_queue(st: &Rc<State>) {
     let Some(app) = st.app.upgrade() else { return };
-    let q = st.queue.borrow();
-    st.models.queue.set(q.items(), q.current_index());
     let store = app.global::<QueueStore>();
-    store.set_rows(ModelRc::from(st.models.queue.clone()));
-    store.set_current(q.current_index().map_or(-1, |i| i as i32));
-    store.set_summary(queue_summary(q.items().len(), q.items().iter().map(|i| i.track.duration).sum()).into());
+    if st.models.queue.refresh() {
+        let summary = {
+            let q = st.queue.borrow();
+            queue_summary(q.items().len(), q.items().iter().map(|i| i.track.duration).sum())
+        };
+        store.set_rows(ModelRc::from(st.models.queue.clone()));
+        store.set_summary(summary.into());
+    }
+    let current = st.queue.borrow().current_index();
+    store.set_current(current.map_or(-1, |i| i as i32));
 }
 
 /// "1 track · 4 min", "180 tracks · 32 h 24 min"; "" for an empty queue.
@@ -854,6 +861,7 @@ pub fn refresh_now_playing(st: &Rc<State>) {
         p.set_artist("".into());
         p.set_track_id(0);
         p.set_album("".into());
+        p.set_cover_stem("".into());
         p.set_cover(Default::default());
         crate::metadata::details::now_playing(st);
         crate::media::update_metadata(st, None);
@@ -871,26 +879,19 @@ pub fn refresh_now_playing(st: &Rc<State>) {
     p.set_track_id(t.id.max(0) as i32);
     p.set_album(t.album.as_str().into());
     p.set_album_id(t.album_id as i32);
-    p.set_has_cover(t.art.is_some());
     p.set_favourite(t.id > 0 && query::is_favourite_track(&st.db, t.id).unwrap_or(false));
-    p.set_cover(Default::default());
-    p.set_full(Default::default());
     crate::theme::accent::follow(&st.art, t.art.clone());
     crate::visualizer::follow_art(st, t.art.clone());
-    if let Some(stem) = &t.art {
-        for kind in [Kind::Thumb, Kind::Full] {
+    let stem = t.art.as_deref().unwrap_or_default();
+    if p.get_cover_stem().as_str() != stem {
+        p.set_cover_stem(stem.into());
+        p.set_cover(Default::default());
+        if !stem.is_empty() {
             let weak = st.app.clone();
-            let id = t.album_id as i32;
-            covers::with_image(stem, kind, move |img| {
-                if let Some(app) = weak.upgrade() {
-                    let p = app.global::<Player>();
-                    if p.get_album_id() == id {
-                        if kind == Kind::Thumb {
-                            p.set_cover(img);
-                        } else {
-                            p.set_full(img);
-                        }
-                    }
+            let wanted = p.get_cover_stem();
+            covers::with_image(stem, Kind::Thumb, move |img| {
+                if let Some(app) = weak.upgrade() && app.global::<Player>().get_cover_stem() == wanted {
+                    app.global::<Player>().set_cover(img);
                 }
             });
         }

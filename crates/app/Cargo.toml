@@ -47,6 +47,10 @@ raw-window-handle = "0.6"
 rfd = "0.18.0"
 toml = "1.2.1"
 
+[build-dependencies]
+# The macOS Now Playing artwork callback uses Objective-C ARC.
+cc = "1"
+
 [dev-dependencies]
 # The Navidrome stand-in for the server tests (server/sync.rs, server/write.rs).
 subsonic = { path = "../subsonic", features = ["mock"] }
@@ -71,10 +75,11 @@ slint = { workspace = true, features = ["renderer-skia-opengl"] }
 
 # macOS (platform/macos): media keys and Now Playing (souvlaki, as on Windows), AppKit and
 # Foundation through the objc2 bindings (the versions Slint's winit backend and tray already
-# use, so nothing new is built, and no SDK or bindgen is needed to build them), block2 for
+# use), the artwork request block compiled against the macOS SDK, block2 for
 # their notification blocks, and libc for the time zone, the socket's permissions and the
 # bench's CPU time.
 [target.'cfg(target_os = "macos")'.dependencies]
+softbuffer = { version = "0.4.8", default-features = false }
 souvlaki = "0.9.3"
 libc = "0.2"
 objc2 = "0.6.3"

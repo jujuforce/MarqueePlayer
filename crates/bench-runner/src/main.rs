@@ -123,6 +123,7 @@ const MODES: &[Mode] = &[
     // The interface size, then the next start on the same data folder keeping it.
     Mode { name: "zoom", bench: "zoom", sets: &["core"], limit: 180, env: &[], linux: true, kind: Kind::Zoom },
     Mode { name: "viz-idle", bench: "viz-idle", sets: &["viz"], limit: 120, env: &[("MP_BENCH_VIZ_SECS", "6"), ("MP_BENCH_IDLE_SECS", "10")], linux: true, kind: Kind::Plain },
+    Mode { name: "playback-cost", bench: "playback-cost", sets: &["viz"], limit: 120, env: &[], linux: true, kind: Kind::Plain },
     Mode { name: "viz-styles", bench: "viz-styles", sets: &["viz"], limit: 600, env: &[], linux: true, kind: Kind::Plain },
     Mode { name: "viz-cost", bench: "viz-cost", sets: &["viz"], limit: 400, env: &[("MP_BENCH_VIZ_SECS", "2")], linux: true, kind: Kind::Plain },
     Mode { name: "viz-look", bench: "viz-look", sets: &["viz"], limit: 600, env: &[], linux: true, kind: Kind::Plain },

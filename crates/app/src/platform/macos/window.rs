@@ -67,11 +67,112 @@ fn with_window<R>(f: impl FnOnce(&AppWindow, &winit::window::Window) -> R) -> Op
     app.window().with_winit_window(|w| f(&app, w))
 }
 
+fn content_view(window: &winit::window::Window) -> Option<*mut std::ffi::c_void> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let RawWindowHandle::AppKit(view) = window.window_handle().ok()?.as_raw() else { return None };
+    Some(view.ns_view.as_ptr())
+}
+
+/// The live surface, when AppKit has attached it to the window.
+fn window_surface(window: &winit::window::Window) -> Option<i32> {
+    unsafe extern "C" {
+        fn mp_macos_window_surface(view: *mut std::ffi::c_void) -> i32;
+    }
+    // SAFETY: winit keeps the NSView alive here, and this callback runs on its UI thread.
+    Some(unsafe { mp_macos_window_surface(content_view(window)?) })
+}
+
+#[derive(PartialEq)]
+struct ClockText {
+    elapsed: slint::SharedString,
+    family: slint::SharedString,
+    ink: slint::Color,
+    font_size: f32,
+    scale: f32,
+    size: slint::PhysicalSize,
+}
+
+#[derive(Default)]
+struct ClockRaster {
+    image: Option<(ClockText, slint::SharedPixelBuffer<slint::Rgba8Pixel>)>,
+    revision: u64,
+}
+
+impl ClockRaster {
+    fn render(&mut self, paint: &crate::ProgressPaint, scale: f32) -> Option<(&slint::SharedPixelBuffer<slint::Rgba8Pixel>, u64)> {
+        let size = slint::PhysicalSize::new(
+            (paint.clock.width * scale).round() as u32,
+            (paint.clock.height * scale).round() as u32,
+        );
+        if paint.elapsed.is_empty() || size.width == 0 || size.height == 0 {
+            return None;
+        }
+        let text = ClockText {
+            elapsed: paint.elapsed.clone(), family: paint.family.clone(), ink: paint.dim,
+            font_size: paint.font_size, scale, size,
+        };
+        if self.image.as_ref().is_none_or(|(old, _)| *old != text) {
+            // winit creates even hidden native windows on the next macOS event-loop turn.
+            // Drop the text component after its CPU snapshot. Only the small bitmap stays.
+            let stamp = crate::ClockStamp::new().ok()?;
+            let window = stamp.window();
+            window.dispatch_event(slint::platform::WindowEvent::ScaleFactorChanged { scale_factor: scale });
+            window.set_size(size);
+            stamp.set_elapsed(text.elapsed.clone());
+            stamp.set_family(text.family.clone());
+            stamp.set_type_size(text.font_size);
+            stamp.set_ink(text.ink);
+            self.image = Some((text, window.take_snapshot().ok()?));
+            self.revision += 1;
+        }
+        self.image.as_ref().map(|(_, pixels)| (pixels, self.revision))
+    }
+}
+
+/// Present the steady transport on the Metal window, or let Slint paint it if unavailable.
+fn paint_progress(clock: &mut ClockRaster, paint: crate::ProgressPaint) -> bool {
+    unsafe extern "C" {
+        fn mp_transport_paint(
+            view: *mut std::ffi::c_void, scale: f32, width: u32,
+            fill: *const [f32; 4], clock: *const [f32; 4],
+            rgba: *const u8, w: u32, h: u32, revision: u64, ink: u32,
+        ) -> bool;
+    }
+    let rect = |r: crate::StageBounds| [r.x, r.y, r.width, r.height];
+    with_window(|app, window| {
+        let Some(view) = content_view(window) else { return false };
+        let scale = app.window().scale_factor();
+        let (rgba, w, h, revision) = clock.render(&paint, scale).map_or(
+            (std::ptr::null(), 0, 0, 0),
+            |(pixels, revision)| (pixels.as_bytes().as_ptr(), pixels.width(), pixels.height(), revision),
+        );
+        // SAFETY: the NSView and bitmap are valid for the call, on their UI thread.
+        unsafe {
+            mp_transport_paint(
+                view, scale, app.window().size().width, &rect(paint.fill), &rect(paint.clock),
+                rgba, w, h, revision, paint.ink.as_argb_encoded(),
+            )
+        }
+    }).unwrap_or(false)
+}
+
+/// The renderer installed in the current window.
+pub fn renderer() -> Option<&'static str> {
+    with_window(|_, window| match window_surface(window)? {
+        1 => Some(super::system::TILED_RENDERER),
+        2 => Some("Metal GPU window surface"),
+        _ => None,
+    }).flatten()
+}
+
 /// Once the winit window exists: keep the hooks, tell the UI the caption is the system's,
 /// report the zoomed state, follow the app terminating. The handle is 0 (macOS code finds the
 /// window through the app).
 pub fn install(app: &AppWindow, hooks: Hooks) -> Option<isize> {
-    let maximized = app.window().with_winit_window(|w| w.is_maximized())?;
+    let (maximized, surface) = app.window().with_winit_window(|w| (w.is_maximized(), window_surface(w)))?;
+    let mut clock = ClockRaster::default();
+    app.on_paint_progress(move |paint| paint_progress(&mut clock, paint));
+    app.global::<crate::Visualizer>().set_metal_surface(surface == Some(2));
     APP.with(|a| *a.borrow_mut() = Some(app.as_weak()));
     HOOKS.with(|h| h.set(Some(hooks)));
     MAXIMIZED.with(|m| m.set(Some(maximized)));

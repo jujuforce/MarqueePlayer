@@ -265,20 +265,20 @@ impl Tracker {
         }
         let src = &samples[samples.len() - n..];
         let norm = 16.0 / (n as f32 * n as f32);
-        let low = KICK_HZ
-            .iter()
-            .map(|&hz| {
-                let c = 2.0 * (std::f32::consts::TAU * hz / rate as f32).cos();
-                let (mut s1, mut s2) = (0.0f32, 0.0f32);
-                for (&x, &w) in src.iter().zip(&self.window) {
-                    let s0 = x * w + c * s1 - s2;
-                    s2 = s1;
-                    s1 = s0;
-                }
-                (s1 * s1 + s2 * s2 - c * s1 * s2) * norm
-            })
-            .sum::<f32>()
-            .max(0.0);
+        // Window each sample once and advance the independent kick filters together.
+        let coeff = KICK_HZ.map(|hz| 2.0 * (std::f32::consts::TAU * hz / rate as f32).cos());
+        let (mut s1, mut s2) = ([0.0; KICK_HZ.len()], [0.0; KICK_HZ.len()]);
+        for (&x, &w) in src.iter().zip(&self.window) {
+            let sample = x * w;
+            for k in 0..KICK_HZ.len() {
+                let s0 = sample + coeff[k] * s1[k] - s2[k];
+                s2[k] = s1[k];
+                s1[k] = s0;
+            }
+        }
+        let low = (0..KICK_HZ.len())
+            .map(|k| (s1[k] * s1[k] + s2[k] * s2[k] - coeff[k] * s1[k] * s2[k]) * norm)
+            .sum::<f32>().max(0.0);
         // The newer half only: a snap is short, and half the window tells it sooner.
         let recent = &src[n / 2..];
         let high = recent.windows(2).map(|w| (w[1] - w[0]) * (w[1] - w[0])).sum::<f32>() / recent.len() as f32;
@@ -297,10 +297,14 @@ impl Tracker {
         if self.heard.len() < 4 || self.heard.iter().filter(|k| k.2).count() < 2 {
             return;
         }
-        let now = self.now;
-        let weight = |k: &(f64, f32, bool)| f64::from(k.1) * (-(now - k.0) / 5.0).exp();
-        let total: f64 = self.heard.iter().map(weight).sum::<f64>().max(1e-9);
-        let kicks: f64 = self.heard.iter().filter(|k| k.2).map(weight).sum::<f64>().max(1e-9);
+        // Each onset's weight is the same for every candidate tempo.
+        let mut weights = [0.0; KEPT];
+        for (w, &(time, strength, _)) in weights.iter_mut().zip(&self.heard) {
+            *w = f64::from(strength) * (-(self.now - time) / 5.0).exp();
+        }
+        let weighted = || self.heard.iter().zip(weights.iter().copied());
+        let total = weighted().map(|(_, w)| w).sum::<f64>().max(1e-9);
+        let kicks = weighted().filter(|(k, _)| k.2).map(|(_, w)| w).sum::<f64>().max(1e-9);
         let (first, last) = (self.heard.front().unwrap().0, self.heard.back().unwrap().0);
         let mut on = [0.0f32; 64];
         let mut best = (0.0f32, 0.0f32, 0.0f32, 0.0f64);
@@ -311,15 +315,18 @@ impl Tracker {
             // and the kicks alone on the beats.
             let mut z = [(0.0f64, 0.0f64); 3];
             let mut zk = (0.0f64, 0.0f64);
-            for k in &self.heard {
-                let (a, w) = (std::f64::consts::TAU * (k.0 / p), weight(k));
-                for (i, turns) in [1.0, 2.0, 4.0].iter().enumerate() {
-                    z[i].0 += w * (a * turns).cos();
-                    z[i].1 += w * (a * turns).sin();
-                }
+            for (k, w) in weighted() {
+                let angle = std::f64::consts::TAU * (k.0 / p);
+                let (mut sin, mut cos) = angle.sin_cos();
                 if k.2 {
-                    zk.0 += w * a.cos();
-                    zk.1 += w * a.sin();
+                    zk.0 += w * cos;
+                    zk.1 += w * sin;
+                }
+                for harmonic in &mut z {
+                    harmonic.0 += w * cos;
+                    harmonic.1 += w * sin;
+                    // The next circle turns twice as fast.
+                    (sin, cos) = (2.0 * sin * cos, cos * cos - sin * sin);
                 }
             }
             let size = |v: (f64, f64), of: f64| ((v.0 * v.0 + v.1 * v.1).sqrt() / of) as f32;
@@ -349,12 +356,11 @@ impl Tracker {
             // put things on a grid does not repeat.
             let bar = 4.0 * p;
             let (mut again, mut could) = (0.0f64, 0.0f64);
-            for k in &self.heard {
+            for (k, w) in weighted() {
                 let (before, after) = (k.0 - bar, k.0 + bar);
                 if before < first - 0.08 && after > last + 0.08 {
                     continue;
                 }
-                let w = weight(k);
                 could += w;
                 if self.heard.iter().any(|j| j.2 == k.2 && ((j.0 - before).abs() < 0.07 || (j.0 - after).abs() < 0.07)) {
                     again += w;

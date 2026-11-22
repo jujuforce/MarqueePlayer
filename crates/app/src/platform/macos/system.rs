@@ -20,11 +20,19 @@ pub fn app_dirs() -> crate::paths::Dirs {
 /// (`ui_font`).
 pub const THEME_FONT: &str = "\"\"";
 
-/// Renderers to try (`main::select_renderer`): Skia, on Metal.
 /// Skia's OpenGL surface is not in the macOS build (Apple deprecated OpenGL).
 pub const HAS_SKIA_OPENGL: bool = false;
 
-pub const RENDERERS: &[(&str, &str)] = &[("skia", "Skia (Metal)")];
+/// Core Animation composites Slint's retained software tiles and the native visualizer.
+pub const TILED_RENDERER: &str = "Core Animation compositor, software-rendered UI tiles";
+pub const RENDERERS: &[(&str, &str)] = &[("skia", "Skia (Metal)"), ("software", TILED_RENDERER)];
+
+/// A headless Mac or a machine without a Metal device can still open the tiled player.
+pub fn has_metal_device() -> bool {
+    unsafe extern "C" { fn mp_macos_has_metal_device() -> bool; }
+    // SAFETY: the function checks Metal's default device without keeping it.
+    unsafe { mp_macos_has_metal_device() }
+}
 
 /// The menu bar's status item is always the static glyph: each frame of the moving one went
 /// through Slint's AppKit tray as a PNG encoded and decoded again, then a menu bar redraw, five
@@ -130,17 +138,19 @@ pub fn gui_objects() -> (u32, u32) {
     (0, 0)
 }
 
-/// This process's memory (resident and peak resident, in MB) and open file descriptors (the
-/// bench's long runs watch them for growth). The peak from `getrusage` (bytes on macOS); the
-/// resident size now is not read (it needs the Mach task API): the peak stands in for it.
+/// Current and peak physical footprint in MiB (including Metal allocations), and open file descriptors.
 #[cfg(feature = "bench")]
 pub fn resources() -> (f64, f64, u32) {
-    // SAFETY: as in `cpu_time`.
-    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
-    // SAFETY: as above.
-    let peak = if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) } == 0 { u.ru_maxrss as f64 / 1_048_576.0 } else { 0.0 };
     let fds = std::fs::read_dir("/dev/fd").map(|d| d.count().saturating_sub(1) as u32).unwrap_or(0);
-    (peak, peak, fds)
+    let mut usage = std::mem::MaybeUninit::<libc::rusage_info_v4>::uninit();
+    // SAFETY: proc_pid_rusage writes a v4 record on success, despite its opaque buffer type.
+    unsafe {
+        if libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, usage.as_mut_ptr().cast()) != 0 {
+            return (0.0, 0.0, fds);
+        }
+        let usage = usage.assume_init();
+        (usage.ri_phys_footprint as f64 / 1_048_576.0, usage.ri_lifetime_max_phys_footprint as f64 / 1_048_576.0, fds)
+    }
 }
 
 /// About's credits for what only the macOS build links (`about::credits`).

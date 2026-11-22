@@ -169,8 +169,21 @@ pub(crate) fn out_dir() -> PathBuf {
     d
 }
 
+pub(crate) fn window_pixels(app: &AppWindow) -> Option<slint::SharedPixelBuffer<slint::Rgba8Pixel>> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut frame = crate::visualizer::macos::snapshot(app).or_else(|| app.window().take_snapshot().ok())?;
+        unsafe extern "C" { fn mp_transport_snapshot(rgba: *mut u8, width: u32, height: u32); }
+        // SAFETY: the main-thread presenter paints over this whole, uniquely borrowed RGBA buffer.
+        unsafe { mp_transport_snapshot(frame.make_mut_bytes().as_mut_ptr(), frame.width(), frame.height()) };
+        Some(frame)
+    }
+    #[cfg(not(target_os = "macos"))]
+    app.window().take_snapshot().ok()
+}
+
 pub(crate) fn snapshot(app: &AppWindow, name: &str) -> Option<image::RgbaImage> {
-    let buf = app.window().take_snapshot().ok()?;
+    let buf = window_pixels(app)?;
     let img = image::RgbaImage::from_raw(buf.width(), buf.height(), buf.as_bytes().to_vec())?;
     let path = out_dir().join(format!("{name}.png"));
     if let Err(e) = img.save(&path) {
@@ -268,7 +281,9 @@ pub fn install(app: &AppWindow) {
         return;
     }
     let frames = Rc::new(RefCell::new(Frames::default()));
-    {
+    // A rendering notifier forces Skia to invalidate the entire surface. Install
+    // it only for scenarios which actually measure individual Slint draws.
+    if matches!(mode.as_str(), "grid" | "sidebar" | "playlist") {
         let frames = frames.clone();
         let res = app.window().set_rendering_notifier(move |state, _| {
             let mut f = frames.borrow_mut();
@@ -320,6 +335,7 @@ pub fn install(app: &AppWindow) {
             "visualizer" => crate::bench::visualizer::run(),
             "settings" => crate::bench::settings::run(),
             "viz-idle" => crate::bench::visualizer::run_idle(),
+            "playback-cost" => crate::bench::visualizer::playback_cost(),
             "autoscroll" => crate::bench::autoscroll::run(),
             "tray" => crate::bench::autoscroll::run_tray(),
             "details" => crate::bench::details::run(),
@@ -1212,10 +1228,68 @@ fn covers_after_flick() {
                     );
                     verdict(&mut text, "covers are on screen after the flick", !range.is_empty(), range.len());
                     verdict(&mut text, "every cover on screen is in memory within 3 s of the flick stopping", visible_after < Duration::from_secs(3), format!("{:.0} ms", visible_after.as_secs_f64() * 1000.0));
-                    write_report("covers", &text);
-                    let _ = slint::quit_event_loop();
+                    playback_covers(text);
                 });
             });
+        })),
+    ]);
+}
+
+/// The player bar only needs a thumbnail. Opening Now Playing requests the large
+/// image, and fast skips must leave both images showing the current track.
+fn playback_covers(text: String) {
+    use crate::covers::{self, Kind};
+    use crate::Player;
+
+    fn current_image(app: &AppWindow, kind: Kind) -> bool {
+        let p = app.global::<Player>();
+        let stem = p.get_cover_stem();
+        let displayed = if kind == Kind::Full { p.get_full() } else { p.get_cover() };
+        !stem.is_empty() && covers::cached(&stem, kind) && covers::get(&stem, kind) == Some(displayed)
+    }
+
+    let log = Rc::new(RefCell::new(text));
+    let (bar, full, skipped) = (log.clone(), log.clone(), log.clone());
+    run_steps(vec![
+        (0, Box::new(|st, _| {
+            // Two distinct covers from the fixture library.
+            let mut seen = std::collections::HashSet::new();
+            let tracks = library::query::all_albums(&st.db, library::query::AlbumSort::Artist, false)
+                .unwrap_or_default().into_iter().filter(|a| a.art.as_ref().is_some_and(|s| seen.insert(s.clone())))
+                .filter_map(|a| library::query::album_tracks(&st.db, a.id).ok()?.into_iter().next()).take(2).collect();
+            playback::play_tracks(st, tracks, 0);
+        })),
+        (400, Box::new(move |st, app| {
+            let p = app.global::<Player>();
+            let stem = p.get_cover_stem();
+            let ok = current_image(app, Kind::Thumb) && !covers::cached(&stem, Kind::Full) && p.get_full().size().width == 0;
+            verdict(&mut bar.borrow_mut(), "the player bar loads only its thumbnail", ok, stem);
+            views::go(st, Page::NowPlaying);
+        })),
+        (500, Box::new(move |st, app| {
+            verdict(&mut full.borrow_mut(), "Now Playing loads the current full cover on entry", current_image(app, Kind::Full), app.get_full_cover_stem());
+            playback::queue_play(st, 1);
+            playback::queue_play(st, 0);
+            playback::queue_play(st, 1);
+        })),
+        (500, Box::new(move |st, app| {
+            let ok = st.queue.borrow().current_index() == Some(1) && current_image(app, Kind::Thumb) && current_image(app, Kind::Full);
+            verdict(&mut skipped.borrow_mut(), "both covers follow rapid skips", ok, app.get_full_cover_stem());
+            #[cfg(target_os = "macos")]
+            {
+                let path = st.art.paths(&app.get_full_cover_stem()).full;
+                let matches = crate::platform::media::artwork_matches;
+                verdict(&mut skipped.borrow_mut(), "macOS Now Playing serves the current album after skips", matches(Some(&path)), path.display());
+                crate::media::update_metadata(st, None);
+                verdict(&mut skipped.borrow_mut(), "clearing metadata releases the native cover", matches(None), "empty Now Playing artwork");
+            }
+            views::go(st, Page::Albums);
+        })),
+        (200, Box::new(move |_, app| {
+            let ok = app.global::<Player>().get_full().size().width == 0;
+            verdict(&mut log.borrow_mut(), "leaving Now Playing releases its displayed full cover", ok, app.get_full_cover_stem());
+            write_report("covers", &log.borrow());
+            let _ = slint::quit_event_loop();
         })),
     ]);
 }

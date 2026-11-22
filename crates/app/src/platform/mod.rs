@@ -58,6 +58,30 @@ mod unix;
 
 pub use imp::{devwindow, instance, integration, media, placement, secret, shell, system, tray, window};
 
+/// The macOS visualizer draws behind the premultiplied Slint window layer.
+pub fn configure_renderer(_name: &str) {
+    #[cfg(target_os = "macos")]
+    softbuffer::set_macos_premultiplied_layer(matches!(_name, "software" | "sw").then_some("MarqueeSlintForeground"));
+}
+
+/// On macOS selecting Skia requests Metal explicitly. The generic Skia
+/// renderer can otherwise fall back to its software surface when GPU initialization fails.
+pub fn explicit_renderer(selector: slint::BackendSelector, name: &str) -> slint::BackendSelector {
+    #[cfg(target_os = "macos")]
+    if matches!(name, "skia" | "winit-skia" | "winit-skia-wgpu") {
+        return selector.backend_name("winit-skia".into()).require_metal();
+    }
+    selector.backend_name(name.to_owned())
+}
+
+pub fn window_renderer(selected: &'static str) -> &'static str {
+    #[cfg(target_os = "macos")]
+    if let Some(renderer) = imp::window::renderer() {
+        return renderer;
+    }
+    selected
+}
+
 /// The app's id: the Linux desktop file's name, its icon's, the Wayland app id and X11
 /// class, the PipeWire application id and the MPRIS bus name's last part, so the desktop
 /// groups the window with its launcher and shows its icon everywhere; on macOS the
