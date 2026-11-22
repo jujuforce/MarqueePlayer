@@ -527,6 +527,18 @@ struct CoverRetry {
     paused: bool,
 }
 
+impl CoverRetry {
+    /// A sync asks for the covers again. After a pass that ran to its end the deferred covers
+    /// get another try. After a paused one they stay skipped for one more pass: the newest
+    /// albums come first, so retrying them at once would pause at the same covers on every
+    /// sync and never reach the older albums.
+    fn kicked(&mut self) {
+        if !std::mem::take(&mut self.paused) {
+            self.skipped.clear();
+        }
+    }
+}
+
 struct Covers {
     work: Mutex<CoverWork>,
     ready: Condvar,
@@ -568,7 +580,7 @@ pub(super) fn covers_start(db: PathBuf, art: ArtCache, written: impl Fn(u64, Vec
                     w = c.ready.wait(w).unwrap_or_else(|e| e.into_inner());
                 }
                 if std::mem::take(&mut w.kicked) {
-                    retry = CoverRetry::default();
+                    retry.kicked();
                 }
                 (w.client.clone().expect("checked"), w.generation, std::mem::take(&mut w.wanted))
             };
@@ -686,10 +698,18 @@ fn fetch(client: &Client, art: &ArtCache, cover: &str) -> Fetched {
                 Fetched::Missing
             }
         },
-        Err(Error::NotFound(_) | Error::BadResponse(_)) => Fetched::Missing,
-        // Subsonic can also report an item error in a successful HTTP response.
-        Err(Error::Server { http_status: Some(200 | 500) | None, .. }) => Fetched::Deferred,
-        Err(e) => Fetched::Pause(e),
+        Err(e) => unfetched(e),
+    }
+}
+
+fn unfetched(e: Error) -> Fetched {
+    match e {
+        Error::NotFound(_) | Error::BadResponse(_) => Fetched::Missing,
+        // Subsonic can also report an item error in a successful HTTP response. A cover the
+        // account may not read is one item's too: recorded as missing it would never be asked
+        // for again, and as a pause it would stop every other cover.
+        Error::Server { http_status: Some(200 | 500) | None, .. } | Error::NotPermitted(_) => Fetched::Deferred,
+        e => Fetched::Pause(e),
     }
 }
 
@@ -768,6 +788,26 @@ mod tests {
     use super::*;
 
     use subsonic::mock::{self, Mock, Trouble};
+
+    #[test]
+    fn a_cover_that_cannot_be_read_is_one_covers_failure() {
+        assert!(matches!(unfetched(Error::NotFound("x".into())), Fetched::Missing));
+        assert!(matches!(unfetched(Error::NotPermitted("x".into())), Fetched::Deferred));
+        assert!(matches!(unfetched(Error::Server { code: None, http_status: Some(500), message: String::new() }), Fetched::Deferred));
+        assert!(matches!(unfetched(Error::Network("x".into())), Fetched::Pause(_)));
+    }
+
+    #[test]
+    fn a_sync_after_a_pause_goes_past_the_covers_that_failed() {
+        let mut retry = CoverRetry::default();
+        retry.skipped.insert(1);
+        retry.paused = true;
+        retry.kicked();
+        assert!(!retry.paused && retry.skipped.contains(&1), "the next pass starts beyond them");
+        // That pass ran to its end: the one after tries them again.
+        retry.kicked();
+        assert!(retry.skipped.is_empty());
+    }
 
     /// A cover as a server sends one: a small PNG of one colour.
     fn png(rgb: [u8; 3]) -> Vec<u8> {
