@@ -17,6 +17,16 @@ fn main() {
             build.define("MP_BENCH", None);
         }
         build.files(sources).flag("-fobjc-arc").compile("marquee_appkit");
+        // `@available` asks clang's runtime library once the deployment target is older than the
+        // version it names (the release build's MACOSX_DEPLOYMENT_TARGET, `cargo xtask release`).
+        // rustc does not link that library, so it is named here.
+        match build.get_compiler().to_command().arg("--print-runtime-dir").output() {
+            Ok(out) if out.status.success() => {
+                println!("cargo:rustc-link-search=native={}", String::from_utf8_lossy(&out.stdout).trim());
+                println!("cargo:rustc-link-lib=static=clang_rt.osx");
+            }
+            _ => println!("cargo:warning=clang's runtime library was not found: a build for an older macOS may not link"),
+        }
         for source in sources {
             println!("cargo:rerun-if-changed={source}");
         }
