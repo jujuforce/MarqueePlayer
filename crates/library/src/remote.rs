@@ -347,14 +347,21 @@ pub struct StreamInfo {
     pub suffix: Option<String>,
     pub content_type: Option<String>,
     pub size: i64,
+    pub bitrate_kbps: Option<u32>,
 }
 
 /// How to stream track `id` from the server: `None` for a track the server does not have.
 pub fn stream_info(conn: &Connection, track_id: i64) -> rusqlite::Result<Option<StreamInfo>> {
     conn.query_row(
-        "SELECT s.id, s.suffix, s.content_type, s.size FROM tracks t JOIN remote_songs s ON s.id = t.remote_id WHERE t.id = ?1",
+        "SELECT s.id, s.suffix, s.content_type, s.size, t.bitrate FROM tracks t JOIN remote_songs s ON s.id = t.remote_id WHERE t.id = ?1",
         [track_id],
-        |r| Ok(StreamInfo { song_id: r.get(0)?, suffix: r.get(1)?, content_type: r.get(2)?, size: r.get::<_, Option<i64>>(3)?.unwrap_or(0) }),
+        |r| Ok(StreamInfo {
+            song_id: r.get(0)?,
+            suffix: r.get(1)?,
+            content_type: r.get(2)?,
+            size: r.get::<_, Option<i64>>(3)?.unwrap_or(0),
+            bitrate_kbps: r.get::<_, Option<u32>>(4)?.filter(|rate| *rate > 0),
+        }),
     )
     .optional()
 }

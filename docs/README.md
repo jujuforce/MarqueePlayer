@@ -16,7 +16,7 @@ Building and maintaining:
 Features:
 
 - [features/library.md](features/library.md): scanning, moves and missing folders, artists and albums from imperfect tags, the art cache, Recently added, the home shelves and the formats played.
-- [features/navidrome.md](features/navidrome.md): a Navidrome server's music in the library: signing in, syncing, covers, and what goes back to the server.
+- [features/navidrome.md](features/navidrome.md): connecting Plex, Navidrome and other Subsonic music servers, syncing their libraries and playing tracks.
 - [features/playback.md](features/playback.md): resuming, ReplayGain, the equalizer, crossfade and the converter, the output device and exclusive mode.
 - [features/scrobbling.md](features/scrobbling.md): Last.fm, ListenBrainz and Discord.
 - [features/lyrics.md](features/lyrics.md): lyrics from files, tags, the server and LRCLIB, their timing and saving them, and streaming the server's tracks.

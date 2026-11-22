@@ -2827,6 +2827,7 @@ dependencies = [
  "cc",
  "crossbeam-channel",
  "discord-ipc",
+ "http-client",
  "image",
  "ksni",
  "lastfm",

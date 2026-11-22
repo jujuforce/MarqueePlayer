@@ -26,8 +26,9 @@ saying what the area is and which file does what:
 crates/app/src/
   main.rs, state.rs, views.rs, nav.rs, playback.rs, queue.rs, ...  the core (below)
   visualizer/   mod.rs (when it runs, the menu), look, draw, presets, share, beat
-  server/       Navidrome: mod.rs (the account's side, when a sync runs), sync, write,
-                navidrome (the sign-in), streaming (tracks played as they download),
+  server/       mod.rs (account state and sync scheduling), account (saved sign-in),
+                provider, plex (Plex Media Server API), sync, write (Subsonic writeback),
+                streaming (tracks played as they download),
                 streammock (a stand-in server for the tests and the bench)
   playlists/    smart (smart playlists) and smartedit (its editor's draft), file (M3U),
                 newplaylist, nameclash
@@ -52,7 +53,7 @@ crates/app/src/
   menu of several tracks act on, and those actions (see [Selecting several tracks](features/navigation.md#selecting-several-tracks)).
 - `edition.rs` is which edition runs (portable, installed, AppImage, standalone), the portable checks (`check_writable`) and library folders following the drive (`follow_drive`, with `library::reroot`), `--minimized`; see [Editions](releases.md#editions). `platform/<system>/integration.rs` recognises the edition and holds what touches the system for it: "Start with Windows", the Default apps page, the installer's mutex and quit event.
 - `covers.rs` and `rows.rs` are lazy models: covers decode off the UI thread, and only rows on screen ask for them. The newest request is decoded first and requests scrolled long past are dropped. The cache budgets 96 MiB for thumbnails and 16 MiB for full-size covers and blurred backdrops.
-- `server/mod.rs` is Settings > Library > Server and when the server's catalog is synced (sign-in, Sync now, Stop, sign-out, what Settings, the sidebar and the pill say); `server/sync.rs` the work on threads of its own (listing the catalog into `library::remote`, the covers of the server's albums); `server/navidrome.rs` the sign-in kept in `navidrome.json`, sealed by `platform::secret` (all unit-tested, the sync against a stand-in server; see [Navidrome](features/navidrome.md#navidrome)).
+- `server/mod.rs` is Settings > Library > Server and when the server's catalog is synced (sign-in, Sync now, Stop, sign-out, what Settings, the sidebar and the pill say); `server/sync.rs` the work on threads of its own (listing the catalog into `library::remote`, the covers of the server's albums); `server/account.rs` the sign-in kept in `navidrome.json`, sealed by `platform::secret` (all unit-tested, the sync against a stand-in server; see [Music servers](features/navidrome.md)).
 - `scanning.rs` runs background scans, folder removal and the folder watcher, one job at a time off the UI thread. The start-up scan and Rescan look at everything; what the watcher reports is scanned only where it happened (`library::scan::scopes`). It words a scan's progress (`tell`: what it does, how far, the time left, a slow or stalled disk), carries Stop, and hands what each batch wrote to the open page (`views::library_changed_live`; see [Scanning](features/library.md#scanning)). `activity.rs` decides what the top right of Home shows of a scan or a sync (see "What it says" under [Scanning](features/library.md#scanning)).
 - `session.rs` saves and restores the queue and playback position (`library::session`); `placement.rs` the window's size, position and maximized state.
 - `search.rs` runs search on its own thread and connection; only the newest query's results are shown. `media.rs` handles media keys and the desktop's media controls (SMTC on Windows, MPRIS on Linux: `platform::media`). `theme/mod.rs` loads the theme file.
@@ -81,7 +82,7 @@ UI (`crates/app/ui`): `theme.slint` holds the tokens, `stores.slint` the globals
 | Tag editing's undo journal (`saves`, `pictures`) and the records of writes under way (`inflight`) | `%APPDATA%\MarqueePlayer\edits` | `~/.local/share/marquee-player/edits` |
 | Last.fm key, secret and session (`lastfm.json`), scrobbles not yet sent (`scrobbles.json`); both deleted by Disconnect | `%APPDATA%\MarqueePlayer` | `~/.local/share/marquee-player` |
 | ListenBrainz's server address, user name and token, the token sealed with DPAPI for the current Windows user (`listenbrainz.json`); listens not yet sent (`listens.json`); Disconnect keeps only the server address | `%APPDATA%\MarqueePlayer` | `~/.local/share/marquee-player` (`listenbrainz.json` mode 0600) |
-| The Navidrome sign-in (`navidrome.json`: the address, the user, what the server is, and the salt and token sealed with DPAPI for the current Windows user; never the password; deleted by signing out) | `%APPDATA%\MarqueePlayer` | `~/.local/share/marquee-player` (the file mode 0600) |
+| The server sign-in (`navidrome.json`), including the selected Plex library and the Plex server token or Subsonic salt and token. Windows seals the credentials with DPAPI for the current user. Signing out deletes the file. | `%APPDATA%\MarqueePlayer` | `~/.local/share/marquee-player` (the file mode 0600) |
 | Each track's lyrics timing offset (`lyrics-offsets.json`: the track's path and milliseconds, only those not 0) | `%APPDATA%\MarqueePlayer` | `~/.local/share/marquee-player` |
 | Art cache (safe to delete; rebuilt by the next scan) | `%LOCALAPPDATA%\MarqueePlayer\art` | `~/.cache/marquee-player/art` |
 | Lyrics found online, and "not found" answers; the server's lyrics of its tracks (`lyrics\server`) (safe to delete; looked up again as tracks play) | `%LOCALAPPDATA%\MarqueePlayer\lyrics` | `~/.cache/marquee-player/lyrics` |

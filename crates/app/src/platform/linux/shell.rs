@@ -83,7 +83,7 @@ fn open_with(program: &std::ffi::OsStr, what: &std::ffi::OsStr) -> bool {
             true
         }
         Err(e) => {
-            log::warn!("xdg-open {}: {e}", what.to_string_lossy());
+            log::warn!("could not start xdg-open: {e}");
             false
         }
     }

@@ -74,51 +74,7 @@ pub fn new_salt() -> String {
 /// and a user or password in the address ("https://me:secret@host"): sign-in takes those
 /// separately, and an address is shown and logged where a password must never be.
 pub fn normalize_url(input: &str) -> Result<String, Error> {
-    let s = input.trim();
-    if s.is_empty() || s.chars().any(char::is_whitespace) {
-        return Err(Error::BadUrl);
-    }
-    let (scheme, rest) = match s.split_once("://") {
-        Some((scheme, rest)) => (scheme.to_ascii_lowercase(), rest),
-        None => ("https".to_owned(), s),
-    };
-    if scheme != "https" && scheme != "http" {
-        return Err(Error::BadUrl);
-    }
-    let rest = rest.split(['?', '#']).next().unwrap_or("");
-    let (authority, path) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        None => (rest, ""),
-    };
-    if authority.contains('@') {
-        return Err(Error::BadUrl);
-    }
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((h, p)) if !p.contains(']') => (h, Some(p)),
-        _ => (authority, None),
-    };
-    let host_ok = if let Some(v6) = host.strip_prefix('[') {
-        v6.strip_suffix(']').is_some_and(|a| !a.is_empty() && a.chars().all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.'))
-    } else {
-        !host.is_empty() && host.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '.' | '_'))
-    };
-    if !host_ok {
-        return Err(Error::BadUrl);
-    }
-    let port = match port {
-        Some(p) => Some(p.parse::<u16>().ok().filter(|&n| n > 0).ok_or(Error::BadUrl)?),
-        None => None,
-    };
-    let mut path = path.trim_end_matches('/');
-    if let Some(p) = path.strip_suffix("/rest") {
-        path = p.trim_end_matches('/');
-    }
-    let mut url = format!("{scheme}://{}", host.to_lowercase());
-    if let Some(p) = port {
-        url.push_str(&format!(":{p}"));
-    }
-    url.push_str(path);
-    Ok(url)
+    http_client::normalize_base_url(input, &["/rest"]).ok_or(Error::BadUrl)
 }
 
 /// Whether the address (as typed or stored) is plain http, so the token would cross the

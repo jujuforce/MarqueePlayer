@@ -74,11 +74,12 @@ local file and on the server is a local file here: `.lrc`, tags, then online.
 
 ## Streaming
 
-A track only the server has plays from its original file (never a transcode: the bytes, the
-technical details, gapless and ReplayGain are the file's own), downloaded into the stream cache
-while it plays (`app/src/server/streaming.rs`; the engine plays a file still being written through
-`player_core::Feed`). Streaming only reads; a play counted is reported to the server as any
-play of a server track is (see "What goes back to the server", under [Navidrome](navidrome.md#navidrome)).
+A track only the server has plays at original quality by default and downloads into the stream
+cache while it plays. In **Settings > Playback > Music from the server**, **Streaming quality**
+can instead request MP3 at 96, 128, 192 or 320 kbps. This is a target average bitrate. A complete
+cached original or a source already at or below the target plays in its original format.
+Tracks already prepared for playback keep their quality. Reporting a play to the server follows the
+rules under “What goes back to the server” in the [Navidrome guide](navidrome.md#navidrome).
 
 - **Starting.** FLAC, MP3, WAV and an MP4 with `moov` first play once their first packets are in.
   An Ogg file (Opus, Vorbis) needs its last page, and an MP4 with `moov` after its audio needs that
@@ -101,27 +102,27 @@ play of a server track is (see "What goes back to the server", under [Navidrome]
 - **Next.** The queue's next track (the engine's gapless next) starts downloading as it becomes
   next, so gapless and crossfade work between server tracks; the one after it once nothing else is
   downloading. Nothing is fetched for a track merely listed on a page.
-- **Failures.** A connection that fails (no answer, a stall of 15 s, a drop mid-file, a 5xx, an
-  empty answer) is retried after 0.5, 1, 2, 4 and 8 s, from where it stopped; after six failures in
-  a row with nothing received, or at once when the file is gone or the sign-in is refused, the pill
+- **Failures.** When an original download loses its connection, Marquee retries from where it
+  stopped after 0.5, 1, 2, 4 and 8 s. After six attempts without progress, or as soon as the
+  server says the file is gone or refuses the sign-in, the pill
   says why ("the server cannot be reached", "the file is no longer on the server", "signed out of
   the server") and the queue moves on as for a damaged file; two tracks in a row failing the same
   way stop playback there. A server that ignores ranges is read in order (Ogg and an MP4 with `moov`
   at the end then start only once they are whole). Signed out, or not connected yet, a server track
   not in the cache cannot play: reached by the queue it is skipped with a word in the pill, and the
   next one that cannot play either stops playback there; chosen, it says why and stays.
-- **The cache.** One file per song, named by its id and its size (a file replaced on the server
-  is fetched again). A file being written has a `.partial` sidecar listing what is on disk, made
-  before the file and removed only once it is whole and synced: after a crash or a skip it is
-  completed from where it was at the next play, and never played as whole meanwhile. A whole cached
-  file plays as a local file, with no request at all, offline too. Settings > Playback > Music from
+- **The cache.** Original files are named by song ID and source size. Encoded copies also include
+  their target bitrate. A file being written has a `.partial` sidecar listing what is on disk,
+  made before the file and removed only once it is whole and synced. Partial originals resume
+  on the next play. Partial MP3 transcodes start again because a new encode can produce different
+  bytes. A whole cached file plays offline as a local file. Settings > Playback > Music from
   the server (shown once there is a server or a cache): how much to keep (2 GB by default, 512 MB to
   64 GB; the least recently played go first, never the track playing or next, nor one being
   written), the space used, and Clear (which keeps the tracks playing and next). Signing out clears
   it.
 - **Stopping.** A download stops at its next chunk when its track is skipped (the engine lets go
   of it and the queue no longer has it current or next), on sign-out (its track fails with "signed
-  out of the server") and at exit; what it wrote stays for the next play to go on from.
+  out of the server") and at exit.
 
-The account side calls `streaming::set_client(Option<subsonic::Client>)` when it connects, signs
+The account side calls `streaming::set_client` when it connects, signs
 in or signs out, and `streaming::clear_cache()` when it signs out.

@@ -107,7 +107,7 @@ impl Ctx {
 
     fn info(&self, id: &str) -> StreamInfo {
         let s = SONGS.iter().find(|s| s.id == id).unwrap();
-        StreamInfo { song_id: id.to_owned(), suffix: Some(s.suffix.into()), content_type: Some(s.content_type.into()), size: self.sizes[id] as i64 }
+        StreamInfo { song_id: id.to_owned(), suffix: Some(s.suffix.into()), content_type: Some(s.content_type.into()), size: self.sizes[id] as i64, ..Default::default() }
     }
 }
 

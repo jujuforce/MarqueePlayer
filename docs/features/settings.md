@@ -18,7 +18,7 @@ switches (the whole row toggles), small choices are segmented controls with ever
 visible (ReplayGain, the close button), the preamp is a stepper (`widgets.slint`: `Switch`,
 `Segmented`, `Stepper`, `SettingCard`, `SettingRow`, `SwitchRow`, `StatusNote`). A section's
 state is at its top: the scan status and unreadable files, and under the folders the
-Navidrome server's sign-in and sync (Library), the device playing
+music server's sign-in and sync (Library), the device playing
 (Output), each service's connection (Connections). Missing tracks held back, a device not
 there or an exclusive-mode fallback, a Last.fm session or a ListenBrainz token to connect again, a Discord application
 ID that was refused, and a server that held back removals or needs signing in again also put a
@@ -118,7 +118,7 @@ Settings > About (`about.rs`, `AboutSection` in `ui/pages/settings/about.slint`)
 version with Copy (one line for a bug report: name, version, Windows version and build,
 x64, the renderer), where the app keeps its files (settings, theme, the database with its
 schema, the art and lyrics caches, the log; each with its path, size and Open folder), the
-library's totals (albums, tracks, length, size of the music files; with a Navidrome server, how
+library's totals (albums, tracks, length, size of the music files; with a music server, how
 many tracks are only in the folders, only on the server and in both), and the open-source
 components it is built on, with Slint's `AboutSlint` badge. Under the copyright line, the
 licence (GPL-3.0 or later) and, once `repository` is set in the workspace's Cargo.toml, the

@@ -83,6 +83,15 @@ export component PlaybackSection inherits VerticalLayout {
         title: "Music from the server";
         SettingRow {
             divider: false;
+            label: "Streaming quality";
+            hint: "Lower MP3 bitrates use less bandwidth. Changes apply to the next stream.";
+            Stepper {
+                label: "Streaming quality";
+                value: Player.stream-quality;
+                step(d) => { Actions.stream-quality-step(d); }
+            }
+        }
+        SettingRow {
             label: "Keep downloaded tracks";
             hint: "Tracks from the server are kept here, to play again without downloading them.";
             more: "A track plays as it downloads; the next one in the queue is fetched ahead, so they follow without a gap. The least recently played go first when the space is used; the tracks playing and next are never removed.";

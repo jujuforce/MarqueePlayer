@@ -405,7 +405,7 @@ export component HomePage inherits Rectangle {
                 spacing: 12px;
                 Text { text: Activity.shown && Activity.title != "" ? Activity.title : "Nothing here yet"; font-size: Theme.font-display; font-weight: 800; color: Theme.text; wrap: word-wrap; }
                 Text {
-                    text: !Activity.shown ? "Add a music folder or connect a Navidrome server to get started." : Activity.text;
+                    text: !Activity.shown ? "Add a music folder or connect a music server to get started." : Activity.text;
                     font-size: Theme.font-title;
                     color: Theme.text-dim;
                     wrap: word-wrap;
@@ -428,7 +428,7 @@ export component HomePage inherits Rectangle {
                     spacing: 10px;
                     TextButton { text: "Add folder"; glyph: Icons.folder; primary: true; clicked => { Actions.add-folder(); } }
                     // Settings > Library's sign-in, in view, its address field focused.
-                    if !Server.signed-in: TextButton { text: "Connect Navidrome"; glyph: Icons.cloud; label: "Connect a Navidrome server: its sign-in, in Settings"; clicked => { Actions.server-open-sign-in(); } }
+                    if !Server.signed-in: TextButton { text: "Connect a server"; glyph: Icons.cloud; label: "Connect a music server in Settings"; clicked => { Actions.server-open-sign-in(); } }
                 }
             }
             for shelf in Home.shelves: Rectangle {

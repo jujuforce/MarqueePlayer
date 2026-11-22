@@ -609,7 +609,7 @@ pub fn tick(st: &Rc<State>) {
                 if let Some(t) = &track {
                     crate::server::write::now_playing(st, t);
                 }
-                let scrobble = track.as_ref().and_then(|t| crate::connections::scrobble::track_started(t, crate::connections::scrobble::allowed(&st.settings.borrow(), t), Some(&st.db)));
+                let scrobble = track.as_ref().and_then(|t| crate::connections::scrobble::track_started(t, crate::connections::scrobble::allowed(&st.settings.borrow(), t, &st.db), Some(&st.db)));
                 *st.listening.borrow_mut() = Listening { token, scrobble, ..Default::default() };
             }
             Event::Ended => {

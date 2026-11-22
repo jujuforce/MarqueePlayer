@@ -142,7 +142,7 @@ pub fn track_changed(st: &Rc<State>, track: Option<&Track>) {
         .spawn(move || {
             let p = std::path::Path::new(&path);
             let l = match &server {
-                Some((id, client, dir)) => from_server(dir, client.as_ref(), id),
+                Some((id, client, dir)) => from_server(dir, client.as_ref().and_then(|c| c.as_subsonic()), id),
                 None => lyrics::load(p),
             };
             // A file from outside the library is looked up only when it has artist and

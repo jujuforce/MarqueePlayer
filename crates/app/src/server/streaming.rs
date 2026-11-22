@@ -1,19 +1,20 @@
 //! Tracks only the server has, played as they download, and the cache their files are kept in.
 //!
-//! **What is fetched.** The original file (`Quality::Original`: ranges work and the length is
-//! known), never a transcode, into the stream cache (`Paths::stream`: `%LOCALAPPDATA%\
+//! **What is fetched.** The original file or an MP3 subject to the configured bitrate cap, into
+//! the stream cache (`Paths::stream`: `%LOCALAPPDATA%\
 //! MarqueePlayer\stream`, `~/.cache/marquee-player/stream`, `cache\stream` under `MP_DATA_DIR`).
 //! Only the queue's current track, its next one (the engine's gapless next, `playback::sync_next`)
 //! and one more after those are fetched; nothing is fetched for a track merely listed on a page.
 //! The client is used for reads only: nothing is written to the server here.
 //!
-//! **One file per song**, named by the song id and its size in the catalog (`key`): a file
-//! replaced on the server under the same id has another size, so a stale copy is never played
-//! (the catalog's hash is not used: it changes with the server's play counts and stars). A file
+//! **One file per representation**, named by the song id, its size in the catalog (`key`) and,
+//! for MP3 transcodes, the bitrate. A change of source size invalidates every version.
+//! The catalog hash changes with the server's play counts and stars, so it isn't used. A file
 //! being written has a sidecar beside it (`<key>.partial`: its length and the stretches on disk),
 //! made before the file and removed only once the whole file is on disk and synced, so a partial
 //! file is never taken for a whole one, after a crash too: a later request goes on from the
-//! stretches the sidecar lists (each checked against the file's size), and a file without a
+//! stretches the sidecar lists for an original. An interrupted transcode restarts from the beginning
+//! because separate encoder runs can produce different bytes. An original without a
 //! sidecar whose size is not the catalog's is deleted. A whole file is played as any local file
 //! (`TrackRequest::new`): no network at all.
 //!
@@ -66,7 +67,9 @@ use std::time::{Duration, Instant, SystemTime};
 use library::remote::StreamInfo;
 use player_core::{Feed, TrackRequest};
 use serde::{Deserialize, Serialize};
-use subsonic::{Client, Quality, StreamHead, StreamSink};
+use subsonic::{StreamHead, StreamSink};
+
+use super::provider::Client;
 
 /// The cache's size by default: 2 GB (a few hundred lossless tracks; `DEFAULT_CAP_MB` in the
 /// settings).
@@ -82,8 +85,7 @@ const BACKOFF: [Duration; 5] = [Duration::from_millis(500), Duration::from_secs(
 /// Failures in a row, with nothing written between them, before a download gives up.
 const ATTEMPTS: usize = 6;
 /// Each read of a song's body: a stall is a failure after this (then retried). Shorter than the
-/// client's own (30 s, made for a server starting a transcode): the original file has no such
-/// start, and a stall should be noticed while the engine still has audio queued.
+/// client's default (30 s), which a server starting a transcode may need.
 const READ_TIMEOUT_MS: u32 = 15_000;
 
 /// What `request` cannot do.
@@ -158,8 +160,54 @@ fn extension(info: &StreamInfo) -> String {
     }
 }
 
-fn data_path(dir: &Path, info: &StreamInfo) -> PathBuf {
-    dir.join(format!("{}.{}", key(info), extension(info)))
+/// Names and size checks for one representation of a catalog track.
+#[derive(Clone)]
+struct CachedFile {
+    key: String,
+    path: PathBuf,
+    bitrate: Option<u32>,
+    expected: u64,
+}
+
+impl CachedFile {
+    fn new(dir: &Path, info: &StreamInfo, bitrate: Option<u32>) -> Self {
+        let original = key(info);
+        let (key, ext, expected) = match bitrate {
+            Some(kbps) => (format!("{original}-mp3-{kbps}k"), "mp3".to_owned(), 0),
+            None => (original, extension(info), info.size.max(0) as u64),
+        };
+        let path = dir.join(format!("{key}.{ext}"));
+        Self { key, path, bitrate, expected }
+    }
+
+    fn discard_partial(&self, sidecar: &Path) {
+        if remove_if_present(&self.path).is_ok() {
+            let _ = fs::remove_file(sidecar);
+        }
+    }
+
+    fn whole(&self) -> bool {
+        if self.path.with_extension("partial").exists() {
+            return false;
+        }
+        let Ok(meta) = fs::metadata(&self.path) else { return false };
+        if !meta.is_file() {
+            return false;
+        }
+        if meta.len() == 0 || (self.expected > 0 && meta.len() != self.expected) {
+            log::warn!("stream cache: {} has an invalid length: deleted", self.path.display());
+            let _ = fs::remove_file(&self.path);
+            return false;
+        }
+        true
+    }
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 fn sidecar_path(dir: &Path, key: &str) -> PathBuf {
@@ -169,22 +217,6 @@ fn sidecar_path(dir: &Path, key: &str) -> PathBuf {
 /// The key a file in the cache belongs to (the name before its first dot).
 fn key_of(name: &str) -> &str {
     name.split('.').next().unwrap_or(name)
-}
-
-/// A whole file for `info` is in the cache: no sidecar, and the catalog's size (when it says
-/// one). A file without a sidecar of another size is no copy of this song: deleted.
-fn whole(dir: &Path, info: &StreamInfo) -> Option<PathBuf> {
-    let path = data_path(dir, info);
-    if sidecar_path(dir, &key(info)).exists() {
-        return None;
-    }
-    let len = fs::metadata(&path).ok().filter(|m| m.is_file())?.len();
-    if info.size > 0 && len != info.size as u64 {
-        log::warn!("stream cache: {} is {len} bytes, not {}: deleted", path.display(), info.size);
-        let _ = fs::remove_file(&path);
-        return None;
-    }
-    Some(path)
 }
 
 /// Mark a cached file as just played (eviction goes by it).
@@ -275,13 +307,14 @@ impl Disk {
     /// Go on from a partial file when its sidecar reads and agrees with the catalog's size; else
     /// start afresh (the sidecar first, then the file: a crash in between leaves a sidecar, never
     /// a file that looks whole).
-    fn open(path: &Path, sidecar: &Path, expected: u64) -> io::Result<Disk> {
+    fn open(file: &CachedFile, sidecar: &Path) -> io::Result<Disk> {
         let mut filled = Vec::new();
         let mut total = None;
         let mut validator = None;
+        let path = &file.path;
         let kept = fs::read(sidecar).ok().and_then(|b| serde_json::from_slice::<Sidecar>(&b).ok());
         match kept {
-            Some(s) if s.size > 0 && (expected == 0 || s.size == expected) => {
+            Some(s) if file.bitrate.is_none() && s.size > 0 && (file.expected == 0 || s.size == file.expected) => {
                 let len = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
                 for (a, b) in s.filled {
                     // Only what the file holds: a stretch past its end was not written.
@@ -291,9 +324,7 @@ impl Disk {
                 validator = s.validator;
                 log::info!("stream cache: going on with {} ({} of {} bytes on disk)", path.display(), filled.iter().map(|r| r.end - r.start).sum::<u64>(), s.size);
             }
-            _ => {
-                let _ = fs::remove_file(path);
-            }
+            _ => remove_if_present(path)?,
         }
         write_sidecar(sidecar, total.unwrap_or(0), &filled, validator.as_deref())?;
         let persisted = Instant::now();
@@ -348,7 +379,7 @@ impl Disk {
     /// Whole: synced, then the sidecar removed (the file is a cached file from here).
     fn finish(&mut self) -> io::Result<()> {
         self.file.sync_all()?;
-        fs::remove_file(&self.sidecar).or_else(|e| if e.kind() == io::ErrorKind::NotFound { Ok(()) } else { Err(e) })
+        remove_if_present(&self.sidecar)
     }
 }
 
@@ -363,9 +394,8 @@ fn write_sidecar(sidecar: &Path, size: u64, filled: &[Range<u64>], validator: Op
 // ---- one download ----------------------------------------------------------------------
 
 struct Download {
-    key: String,
+    file: CachedFile,
     info: StreamInfo,
-    path: PathBuf,
     feed: Feed,
     stop: Mutex<Option<Stop>>,
     woken: Condvar,
@@ -437,7 +467,10 @@ struct Inner {
     /// next `keep`): never evicted, and their downloads go on with no reader.
     kept: HashSet<String>,
     /// The one after those, fetched once nothing else downloads.
-    ahead: Option<StreamInfo>,
+    ahead: Option<(StreamInfo, CachedFile)>,
+    /// Representations already handed to the player for current and gapless-next tracks.
+    requested: HashMap<String, CachedFile>,
+    quality: Option<u32>,
     /// The words of the last failed download of each song (for the pill).
     failures: HashMap<String, String>,
     cap: u64,
@@ -463,7 +496,7 @@ impl Streamer {
         let cap = cfg.cap;
         Arc::new(Streamer {
             cfg,
-            inner: Mutex::new(Inner { client: None, downloads: HashMap::new(), kept: HashSet::new(), ahead: None, failures: HashMap::new(), cap, generation: 0 }),
+            inner: Mutex::new(Inner { client: None, downloads: HashMap::new(), kept: HashSet::new(), ahead: None, requested: HashMap::new(), quality: None, failures: HashMap::new(), cap, generation: 0 }),
             requests: AtomicUsize::new(0),
             running: AtomicUsize::new(0),
             known: AtomicU64::new(0),
@@ -497,12 +530,12 @@ impl Streamer {
     pub fn set_client(&self, client: Option<Client>) {
         let mut g = self.lock();
         let same = match (&g.client, &client) {
-            (Some(a), Some(b)) => a.credentials() == b.credentials(),
+            (Some(a), Some(b)) => a.same_credentials(b),
             (None, None) => true,
             _ => false,
         };
         g.client = client.map(|mut c| {
-            c.stream_timeout_ms = self.cfg.read_timeout_ms;
+            c.set_stream_timeout_ms(self.cfg.read_timeout_ms);
             c
         });
         if !same {
@@ -510,63 +543,90 @@ impl Streamer {
                 d.set_stop(Stop::Fail(SIGNED_OUT.to_owned()));
             }
             g.ahead = None;
+            g.requested.clear();
             g.generation += 1;
         }
+    }
+
+    /// A complete original costs no network bandwidth, even when a cap is set.
+    fn preferred_file(&self, g: &Inner, info: &StreamInfo) -> CachedFile {
+        let original = CachedFile::new(&self.cfg.dir, info, None);
+        if let Some(cap) = g.quality
+            && !info.bitrate_kbps.is_some_and(|rate| rate > 0 && rate <= cap)
+            && !g.downloads.get(&original.key).is_some_and(|d| d.joinable() && d.feed.is_complete())
+            && !original.whole()
+        {
+            CachedFile::new(&self.cfg.dir, info, Some(cap))
+        } else {
+            original
+        }
+    }
+
+    fn set_quality(&self, bitrate: Option<u32>) {
+        self.lock().quality = bitrate;
     }
 
     /// The engine's request for a server-only track: the cached file when it is whole, else the
     /// file growing as it downloads (the download started, or the one under way joined).
     pub fn request(self: &Arc<Self>, token: u64, info: &StreamInfo) -> Result<TrackRequest, Refusal> {
-        let key = key(info);
         let mut g = self.lock();
-        g.kept.insert(key.clone());
-        if let Some(d) = g.downloads.get(&key)
-            && d.joinable()
-        {
-            return Ok(TrackRequest::growing(token, d.path.clone(), d.feed.clone()));
-        }
-        if let Some(path) = whole(&self.cfg.dir, info) {
-            touch(&path);
-            return Ok(TrackRequest::new(token, path));
-        }
-        let Some(client) = g.client.clone() else { return Err(Refusal::NoClient) };
-        let d = self.start(&mut g, info, client);
-        Ok(TrackRequest::growing(token, d.path.clone(), d.feed.clone()))
+        let file = self.preferred_file(&g, info);
+        let req = if let Some(d) = g.downloads.get(&file.key).filter(|d| d.joinable()) {
+            TrackRequest::growing(token, d.file.path.clone(), d.feed.clone())
+        } else if file.whole() {
+            g.failures.remove(&info.song_id);
+            touch(&file.path);
+            TrackRequest::new(token, file.path.clone())
+        } else {
+            let Some(client) = g.client.clone() else { return Err(Refusal::NoClient) };
+            let d = self.start(&mut g, info, file.clone(), client);
+            TrackRequest::growing(token, d.file.path.clone(), d.feed.clone())
+        };
+        g.kept.insert(file.key.clone());
+        g.requested.insert(key(info), file);
+        Ok(req)
     }
 
     /// The tracks the queue plays now and next (kept and fetched; the rest stop once the engine
     /// lets go of them), and the one after them, fetched once nothing else downloads.
     pub fn keep(self: &Arc<Self>, now: &[StreamInfo], ahead: Option<StreamInfo>) {
         let mut g = self.lock();
-        g.kept = now.iter().map(key).collect();
-        g.ahead = ahead;
-        if let Some(k) = g.ahead.as_ref().map(key) {
-            g.kept.insert(k);
-        }
-        if let Some(client) = g.client.clone() {
-            for info in now {
-                let k = key(info);
-                let busy = g.downloads.get(&k).is_some_and(|d| d.joinable());
-                if !busy && whole(&self.cfg.dir, info).is_none() {
-                    self.start(&mut g, info, client.clone());
-                }
+        let ids: HashSet<_> = now.iter().map(key).collect();
+        g.requested.retain(|id, _| ids.contains(id));
+        g.kept.clear();
+        for info in now {
+            let file = g.requested.get(&key(info)).cloned().unwrap_or_else(|| self.preferred_file(&g, info));
+            g.kept.insert(file.key.clone());
+            if let Some(client) = g.client.clone()
+                && !g.downloads.get(&file.key).is_some_and(|d| d.joinable())
+                && !file.whole()
+            {
+                self.start(&mut g, info, file, client);
             }
         }
+        g.ahead = ahead.filter(|a| !ids.contains(&key(a))).map(|info| {
+            let file = self.preferred_file(&g, &info);
+            g.kept.insert(file.key.clone());
+            (info, file)
+        });
         self.start_ahead(&mut g);
     }
 
     /// The track ahead, when nothing else is being fetched.
     fn start_ahead(self: &Arc<Self>, g: &mut Inner) {
         let idle = g.downloads.values().all(|d| d.ended.load(Ordering::Acquire) || d.stopping());
-        let (Some(info), Some(client), true) = (g.ahead.clone(), g.client.clone(), idle) else { return };
-        if whole(&self.cfg.dir, &info).is_none() {
-            g.ahead = None;
-            self.start(g, &info, client);
+        if idle && let Some(client) = g.client.clone() && let Some((info, file)) = g.ahead.take()
+            && !file.whole()
+        {
+            self.start(g, &info, file, client);
         }
     }
 
-    fn start(self: &Arc<Self>, g: &mut Inner, info: &StreamInfo, client: Client) -> Arc<Download> {
-        let key = key(info);
+    fn start(self: &Arc<Self>, g: &mut Inner, info: &StreamInfo, file: CachedFile, mut client: Client) -> Arc<Download> {
+        if file.bitrate.is_some() {
+            client.set_stream_timeout_ms(subsonic::STREAM_TIMEOUT_MS.max(self.cfg.read_timeout_ms));
+        }
+        let key = file.key.clone();
         // One writer per file: a download still stopping is waited for by its successor.
         let before = g.downloads.remove(&key);
         if let Some(b) = &before {
@@ -574,9 +634,8 @@ impl Streamer {
         }
         g.failures.remove(&info.song_id);
         let d = Arc::new(Download {
-            key: key.clone(),
+            file,
             info: info.clone(),
-            path: data_path(&self.cfg.dir, info),
             feed: Feed::new(),
             stop: Mutex::new(None),
             woken: Condvar::new(),
@@ -610,12 +669,14 @@ impl Streamer {
     fn finished(self: &Arc<Self>, d: &Arc<Download>) {
         {
             let mut g = self.lock();
-            let current = g.downloads.get(&d.key).is_none_or(|x| Arc::ptr_eq(x, d));
+            let current = g.downloads.get(&d.file.key).is_none_or(|x| Arc::ptr_eq(x, d));
             if current {
-                g.downloads.remove(&d.key);
+                g.downloads.remove(&d.file.key);
             }
-            // Not when a new download of the file started meanwhile (`start` cleared it).
-            if let Some(m) = d.feed.failure().filter(|_| current) {
+            // The player may already have requested another representation of the song.
+            if current && let Some(m) = d.feed.failure()
+                && g.requested.get(&key(&d.info)).is_none_or(|f| f.key == d.file.key)
+            {
                 g.failures.insert(d.info.song_id.clone(), m);
             }
             self.start_ahead(&mut g);
@@ -633,7 +694,7 @@ impl Streamer {
     /// A whole file for this song is in the cache.
     #[cfg(feature = "bench")]
     pub fn cached(&self, info: &StreamInfo) -> bool {
-        whole(&self.cfg.dir, info).is_some()
+        self.preferred_file(&self.lock(), info).whole()
     }
 
     /// Why the last download of this song failed, if it did.
@@ -643,11 +704,11 @@ impl Streamer {
 
     /// The thread of one download: see the module doc.
     fn download(&self, d: &Download, client: &Client) {
-        let sidecar = sidecar_path(&self.cfg.dir, &d.key);
-        let mut disk = match Disk::open(&d.path, &sidecar, d.info.size.max(0) as u64) {
+        let sidecar = sidecar_path(&self.cfg.dir, &d.file.key);
+        let mut disk = match Disk::open(&d.file, &sidecar) {
             Ok(disk) => disk,
             Err(e) => {
-                log::warn!("stream cache: cannot write {}: {e}", d.path.display());
+                log::warn!("stream cache: cannot write {}: {e}", d.file.path.display());
                 d.feed.fail(format!("the stream cache cannot be written ({e})"));
                 return;
             }
@@ -665,20 +726,21 @@ impl Streamer {
         let mut cursor = disk.filled.first().filter(|r| r.start == 0).map_or(0, |r| r.end);
         let mut failures = 0usize;
         let mut ranges = 0usize;
-        let mut in_order = false;
+        let generated = d.file.bitrate.is_some();
+        let mut in_order = generated;
         loop {
             if disk.whole() {
                 match disk.finish() {
                     Ok(()) => {
                         d.feed.complete();
-                        log::info!("stream: {} whole in {:.1} s ({ranges} ranges asked)", d.key, started.elapsed().as_secs_f64());
+                        log::info!("stream: {} whole in {:.1} s ({ranges} ranges asked)", d.file.key, started.elapsed().as_secs_f64());
                     }
                     Err(e) => d.feed.fail(format!("the stream cache cannot be written ({e})")),
                 }
                 return;
             }
             if let Some(why) = self.stop_reason(d) {
-                log::info!("stream: {} stopped ({why:?}) with {} of {:?} bytes on disk", d.key, disk.filled.iter().map(|r| r.end - r.start).sum::<u64>(), disk.total);
+                log::info!("stream: {} stopped ({why:?}) with {} of {:?} bytes on disk", d.file.key, disk.filled.iter().map(|r| r.end - r.start).sum::<u64>(), disk.total);
                 let _ = disk.persist();
                 if let Stop::Fail(m) = why {
                     d.feed.fail(m);
@@ -701,7 +763,7 @@ impl Streamer {
             let validator = disk.validator.clone();
             let mut sink = Sink { s: self, d, disk: &mut disk, from, pos: from, limit, ended: None, io: None, wrote: 0, in_order };
             self.requests.fetch_add(1, Ordering::Relaxed);
-            let r = client.stream(&d.info.song_id, &Quality::Original, from, validator.as_deref(), &mut sink);
+            let r = client.stream_quality(&d.info.song_id, d.file.bitrate, from, validator.as_deref(), &mut sink);
             let (pos, ended, io_err, wrote) = (sink.pos, sink.ended.take(), sink.io.take(), sink.wrote);
             in_order |= sink.in_order;
             cursor = pos;
@@ -709,19 +771,20 @@ impl Streamer {
                 failures = 0;
             }
             if let Some(e) = io_err {
-                log::warn!("stream cache: writing {}: {e}", d.path.display());
+                log::warn!("stream cache: writing {}: {e}", d.file.path.display());
                 d.feed.fail(format!("the stream cache cannot be written ({e})"));
                 return;
             }
             if let Some(m) = ended.as_ref().and_then(|e| if let Ended::Failed(m) = e { Some(m.clone()) } else { None }) {
-                let _ = fs::remove_file(&sidecar);
-                let _ = fs::remove_file(&d.path);
+                d.file.discard_partial(&sidecar);
                 d.feed.fail(m);
                 return;
             }
             // An answer with nothing in it, the file not whole: as a failed connection (else a
             // server answering empty would be asked again and again).
             let r = match r {
+                Ok(done) if generated && !done.stopped && (pos == 0 || disk.total.is_some_and(|len| len != pos)) =>
+                    Err(subsonic::Error::BadResponse("the server returned an incomplete MP3".into())),
                 Ok(_) if wrote == 0 && disk.total.is_some() && !disk.whole() => Err(subsonic::Error::Network("the server sent none of the file".into())),
                 r => r,
             };
@@ -733,25 +796,30 @@ impl Streamer {
                     }
                     let _ = disk.persist_soon();
                 }
-                Err(e) if e.is_retryable() => {
+                // A fresh encoder run cannot resume bytes already given to the decoder.
+                Err(e) if e.is_retryable() && !(generated && wrote > 0) => {
+                    if generated {
+                        // No body bytes were published. A new encoder session has a new head.
+                        disk.total = None;
+                        disk.validator = None;
+                    }
                     failures += 1;
                     let _ = disk.persist();
                     if failures >= self.cfg.attempts {
-                        log::warn!("stream: {} gave up after {failures} failures: {e}", d.key);
+                        log::warn!("stream: {} gave up after {failures} failures: {e}", d.file.key);
                         d.feed.fail(words(&e));
                         return;
                     }
                     let wait = self.cfg.backoff.get(failures - 1).or(self.cfg.backoff.last()).copied().unwrap_or(Duration::from_secs(1));
-                    log::info!("stream: {} at {pos}: {e}; again in {:.1} s", d.key, wait.as_secs_f64());
+                    log::info!("stream: {} at {pos}: {e}; again in {:.1} s", d.file.key, wait.as_secs_f64());
                     // A stop during the pause is seen at the top of the loop.
                     d.pause(wait);
                 }
                 Err(e) => {
-                    log::warn!("stream: {}: {e}", d.key);
+                    log::warn!("stream: {}: {e}", d.file.key);
                     if disk.filled.is_empty() {
                         // Nothing came: no partial file to go on from.
-                        let _ = fs::remove_file(&sidecar);
-                        let _ = fs::remove_file(&d.path);
+                        d.file.discard_partial(&sidecar);
                     } else {
                         let _ = disk.persist();
                     }
@@ -767,7 +835,7 @@ impl Streamer {
         if let Some(s) = d.stop.lock().unwrap_or_else(|e| e.into_inner()).clone() {
             return Some(s);
         }
-        let kept = self.lock().kept.contains(&d.key);
+        let kept = self.lock().kept.contains(&d.file.key);
         (!kept && d.feed.readers() == 0).then_some(Stop::Quit)
     }
 
@@ -851,6 +919,7 @@ impl Streamer {
                 }
                 g.ahead = None;
                 g.kept.clear();
+                g.requested.clear();
                 HashSet::new()
             } else {
                 g.kept.iter().cloned().chain(g.downloads.iter().filter(|(_, d)| !d.stopping()).map(|(k, _)| k.clone())).collect()
@@ -964,13 +1033,13 @@ impl Sink<'_> {
                 }
                 return Ok(Version::Same);
             }
-            log::info!("stream: {} changed on the server since its partial file was written: written afresh", self.d.key);
+            log::info!("stream: {} changed on the server since its partial file was written: written afresh", self.d.file.key);
             disk.restart(head.total, head.validator.clone())?;
             return Ok(Version::Restarted);
         }
         match (disk.validator.as_deref(), head.validator.as_deref()) {
             (Some(a), Some(b)) if a != b => {
-                log::warn!("stream: {} changed on the server while it downloaded", self.d.key);
+                log::warn!("stream: {} changed on the server while it downloaded", self.d.file.key);
                 self.ended = Some(Ended::Failed("the file changed on the server while it downloaded: play it again".to_owned()));
             }
             (None, Some(b)) => {
@@ -988,10 +1057,12 @@ impl StreamSink for Sink<'_> {
         match (self.disk.total, head.total) {
             (None, t) => {
                 self.disk.total = t;
-                self.d.feed.set_length(t);
+                // Live MP3s may have a length but no byte-range support. Let the decoder
+                // open sequentially rather than waiting for trailing tags.
+                self.d.feed.set_length(t.filter(|_| self.d.file.bitrate.is_none()));
             }
             (Some(a), Some(b)) if a != b => {
-                log::warn!("stream: {} is {b} bytes on the server now, not {a}", self.d.key);
+                log::warn!("stream: {} is {b} bytes on the server now, not {a}", self.d.file.key);
                 self.ended = Some(Ended::Failed("the file changed on the server while it downloaded: play it again".to_owned()));
                 return ControlFlow::Break(());
             }
@@ -1019,7 +1090,7 @@ impl StreamSink for Sink<'_> {
         if head.start != self.from {
             // The range was not honoured: the body is the file from its start, and so will every
             // other be. Read in order from here on (asking elsewhere would only start it again).
-            log::info!("stream: {} asked from {}, the server sends from {}: reading in order", self.d.key, self.from, head.start);
+            log::info!("stream: {} asked from {}, the server sends from {}: reading in order", self.d.file.key, self.from, head.start);
             self.limit = None;
             self.in_order = true;
         }
@@ -1068,9 +1139,10 @@ struct Hub {
     streamer: Option<Arc<Streamer>>,
     /// Set before `install` (a sign-in that came first): handed over then.
     client: Option<Client>,
+    quality: Option<u32>,
 }
 
-static HUB: Mutex<Hub> = Mutex::new(Hub { streamer: None, client: None });
+static HUB: Mutex<Hub> = Mutex::new(Hub { streamer: None, client: None, quality: None });
 
 fn hub() -> MutexGuard<'static, Hub> {
     HUB.lock().unwrap_or_else(|e| e.into_inner())
@@ -1088,6 +1160,7 @@ pub fn install(dir: PathBuf, cap: u64, changed: Arc<dyn Fn(u64) + Send + Sync>) 
     let s = Streamer::new(cfg);
     let mut h = hub();
     s.set_client(h.client.take());
+    s.set_quality(h.quality);
     h.streamer = Some(s.clone());
     drop(h);
     // A cap lowered while the app was closed, or files left from before; and the first count.
@@ -1104,7 +1177,7 @@ pub fn install(dir: PathBuf, cap: u64, changed: Arc<dyn Fn(u64) + Send + Sync>) 
 /// connects, signs in or signs out (the server account's side, `server/mod.rs`). Downloads under way
 /// stop when the account changes or goes (their tracks fail with "signed out of the server").
 /// Only reads are made with it (`stream`; lyrics use it through `client`).
-pub fn set_client(client: Option<subsonic::Client>) {
+pub fn set_client(client: Option<Client>) {
     {
         let mut h = hub();
         match &h.streamer {
@@ -1116,8 +1189,17 @@ pub fn set_client(client: Option<subsonic::Client>) {
     crate::state::post(refresh_ui);
 }
 
+/// Use the selected cap for future streams, including a preference loaded before installation.
+pub fn set_quality(bitrate: Option<u32>) {
+    let mut h = hub();
+    h.quality = bitrate;
+    if let Some(s) = &h.streamer {
+        s.set_quality(bitrate);
+    }
+}
+
 /// The client set (`set_client`), for the other reads of a server track (its lyrics).
-pub fn client() -> Option<subsonic::Client> {
+pub fn client() -> Option<Client> {
     let h = hub();
     match &h.streamer {
         Some(s) => s.lock().client.clone(),
@@ -1256,6 +1338,27 @@ pub fn used_text(bytes: u64) -> String {
 pub fn install_app(st: &std::rc::Rc<crate::state::State>) {
     let mb = st.settings.borrow().stream_cache_mb.max(1);
     install(st.paths.stream(), mb * MB, Arc::new(|bytes| crate::state::post(move |st| show(st, bytes))));
+    set_quality(quality_step(st.settings.borrow().stream_bitrate_kbps, 0));
+    refresh_ui(st);
+}
+
+fn quality_step(bitrate: Option<u32>, d: i32) -> Option<u32> {
+    const LEVELS: [Option<u32>; 5] = [Some(96), Some(128), Some(192), Some(320), None];
+    let original = LEVELS.len() - 1;
+    let at = LEVELS.iter().position(|rate| *rate == bitrate).unwrap_or(original);
+    LEVELS[at.saturating_add_signed(d.signum() as isize).min(original)]
+}
+
+pub fn step_quality(st: &std::rc::Rc<crate::state::State>, d: i32) {
+    let current = st.settings.borrow().stream_bitrate_kbps;
+    let rate = quality_step(current, d);
+    if rate == current {
+        return;
+    }
+    st.settings.borrow_mut().stream_bitrate_kbps = rate;
+    st.save_settings_soon();
+    set_quality(rate);
+    follow_queue(st);
     refresh_ui(st);
 }
 
@@ -1283,6 +1386,8 @@ fn show(st: &std::rc::Rc<crate::state::State>, used: u64) {
     p.set_stream_shown(shown);
     p.set_stream_used(used_text(used).into());
     p.set_stream_cap(cap_text(st.settings.borrow().stream_cache_mb).into());
+    let quality = quality_step(st.settings.borrow().stream_bitrate_kbps, 0);
+    p.set_stream_quality(quality.map_or_else(|| "Original".into(), |rate| format!("{rate} kbps").into()));
 }
 
 /// Settings > Playback: the cap one step up or down.

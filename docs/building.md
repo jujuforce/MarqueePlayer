@@ -71,8 +71,8 @@ folder (`git rev-parse --git-path hooks`, shared by its worktrees; nothing in th
 changes), and refuses to replace a hook that is there (`--force` replaces it). The hook runs the checks on the commits being
 pushed; `git push --no-verify` skips it once, and deleting the file uninstalls it.
 
-On first start, add a music folder or connect a Navidrome server (Settings > Library, or the
-two buttons on the empty home page: Add folder, Connect Navidrome).
+On first start, add a music folder or connect a music server (Settings > Library, or the
+two buttons on the empty home page, Add folder and Connect a server).
 Music folders are only ever read, unless the user turns on tag editing (Settings > Library >
 Edit tags; see [Tag editing](features/metadata.md#tag-editing)).
 

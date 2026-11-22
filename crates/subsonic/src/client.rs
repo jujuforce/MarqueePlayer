@@ -2,9 +2,8 @@
 //! token. Every request URL carries the token and salt, so a URL is never logged, put in an
 //! error, or shown; log lines name the endpoint and the outcome only.
 
-use std::ops::ControlFlow;
-
-use http_client::{Head, Request};
+use http_client::Request;
+use http_client::audio::{self, StreamError, StreamSink, Streamed};
 use serde::de::DeserializeOwned;
 use serde::Deserialize;
 use serde_json::Value;
@@ -23,8 +22,6 @@ pub const TIMEOUT_MS: u32 = 20_000;
 /// For a cover or a song: each read of the body (the whole may take minutes). Longer than
 /// `TIMEOUT_MS`: a server starting a transcode can take a while before the first byte.
 pub const STREAM_TIMEOUT_MS: u32 = 30_000;
-/// The most of an error answer read when a cover or stream request fails.
-const ERROR_BODY: usize = 64 * 1024;
 
 /// The endpoints a read-only client may call; every other is refused before a request is
 /// built. Writes (star, rate, scrobble, playlists) are outside it by design.
@@ -155,44 +152,6 @@ pub struct Cover {
     pub bytes: Vec<u8>,
     /// "image/jpeg", "image/png", "image/webp"; None when the server did not say.
     pub content_type: Option<String>,
-}
-
-/// What a stream's head said, before its body.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct StreamHead {
-    /// The offset in the file of the first byte the body holds: the asked start when the
-    /// range was honoured, else 0 (the whole file comes, from its start).
-    pub start: u64,
-    /// The asked start was honoured (a 206 from it). Always true for a start of 0.
-    pub range_honoured: bool,
-    /// Bytes of this body, when the server said (None for a live transcode).
-    pub length: Option<u64>,
-    /// Bytes of the whole file, when known: from `Content-Range`, or the length of a body
-    /// that is the whole file.
-    pub total: Option<u64>,
-    pub content_type: Option<String>,
-    /// What tells this version of the file from another (`http_client::Head::validator`: its
-    /// strong `ETag`, else its `Last-Modified`), when the server sent one: given back to
-    /// [`Client::stream`] when it goes on from a range, so a range of a file changed since comes
-    /// as the whole new file instead (a 200, `range_honoured` false).
-    pub validator: Option<String>,
-}
-
-/// Where a stream goes; either call can stop it by returning `Break` (it then returns at
-/// once, without reading the rest).
-pub trait StreamSink {
-    fn start(&mut self, head: &StreamHead) -> ControlFlow<()>;
-    fn chunk(&mut self, bytes: &[u8]) -> ControlFlow<()>;
-}
-
-/// How a stream ended, when it did not fail.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Streamed {
-    pub head: StreamHead,
-    /// Body bytes given to the sink.
-    pub received: u64,
-    /// The sink stopped it; otherwise the body was read to its end.
-    pub stopped: bool,
 }
 
 /// What `updatePlaylist` changes; empty fields are left as they are.
@@ -407,7 +366,7 @@ impl Client {
     /// after the sink has had every byte that came. A `range_start` at or past the end of
     /// the file is an empty, finished stream.
     ///
-    /// `if_range`: the validator an earlier answer gave ([`StreamHead::validator`]), sent as
+    /// `if_range`: the validator an earlier answer gave ([`crate::StreamHead::validator`]), sent as
     /// `If-Range` with the `Range`, so the server sends the range only if the file is still that
     /// one, and else the whole file from its start. Not sent without a range.
     pub fn stream(&self, id: &str, quality: &Quality, range_start: u64, if_range: Option<&str>, sink: &mut dyn StreamSink) -> Result<Streamed, Error> {
@@ -421,83 +380,18 @@ impl Client {
             }
         }
         let url = self.url(endpoint, &p)?;
-        let range = format!("Range: bytes={range_start}-");
-        // A validator with a line break in it would be another header: not sent.
-        let if_range = if_range.map(str::trim).filter(|v| !v.is_empty() && !v.contains(['\r', '\n'])).map(|v| format!("If-Range: {v}"));
-        let mut headers: Vec<&str> = Vec::new();
-        if range_start > 0 {
-            headers.push(&range);
-            headers.extend(if_range.as_deref());
-        }
-        let req = Request { method: "GET", url: &url, headers: &headers, body: &[], user_agent: &self.user_agent, timeout_ms: self.stream_timeout_ms };
-
-        /// Sorts the head into audio (to the sink) or an error answer (kept, to read).
-        struct Adapter<'a> {
-            sink: &'a mut dyn StreamSink,
-            range_start: u64,
-            head: Option<StreamHead>,
-            error: Option<(u16, Option<String>, Vec<u8>)>,
-            bad: Option<Error>,
-            empty_end: bool,
-        }
-        impl http_client::Sink for Adapter<'_> {
-            fn head(&mut self, h: &Head) -> ControlFlow<()> {
-                let ct = h.content_type.as_deref().unwrap_or("").to_ascii_lowercase();
-                let answer_not_audio = ct.contains("json") || ct.contains("xml") || ct.starts_with("text/");
-                if h.status == 416 && h.content_range.as_deref().and_then(total_of_unsatisfied) == Some(self.range_start) {
-                    // Asked from the end of the file: nothing more to send.
-                    let head = StreamHead {
-                        start: self.range_start,
-                        range_honoured: true,
-                        length: Some(0),
-                        total: Some(self.range_start),
-                        content_type: h.content_type.clone(),
-                        validator: h.validator().map(str::to_owned),
-                    };
-                    self.empty_end = true;
-                    // Whatever the sink says, there is no body to read.
-                    let _ = self.sink.start(&head);
-                    self.head = Some(head);
-                    return ControlFlow::Break(());
-                }
-                if !(200..300).contains(&h.status) || answer_not_audio {
-                    self.error = Some((h.status, h.content_type.clone(), Vec::new()));
-                    return ControlFlow::Continue(());
-                }
-                let head = match stream_head(h, self.range_start) {
-                    Ok(head) => head,
-                    Err(e) => {
-                        self.bad = Some(e);
-                        return ControlFlow::Break(());
-                    }
-                };
-                let flow = self.sink.start(&head);
-                self.head = Some(head);
-                flow
-            }
-            fn chunk(&mut self, bytes: &[u8]) -> ControlFlow<()> {
-                if let Some((_, _, body)) = &mut self.error {
-                    body.extend_from_slice(&bytes[..bytes.len().min(ERROR_BODY - body.len())]);
-                    return if body.len() >= ERROR_BODY { ControlFlow::Break(()) } else { ControlFlow::Continue(()) };
-                }
-                self.sink.chunk(bytes)
-            }
-        }
-
-        let mut a = Adapter { sink, range_start, head: None, error: None, bad: None, empty_end: false };
-        let r = http_client::download_same_server(&req, &mut a);
-        if let Some(e) = a.bad.take() {
-            return Err(self.failed(endpoint, e));
-        }
-        if let Some((status, ct, body)) = a.error.take() {
-            let e = self.binary_error(status, ct.as_deref(), &body).unwrap_or_else(|| Error::BadResponse("an error answer without an error".into()));
-            return Err(self.failed(endpoint, e));
-        }
-        let d = r.map_err(|e| self.failed(endpoint, Error::Network(e.to_string())))?;
-        let head = a.head.unwrap_or_default();
-        let stopped = d.stopped && !a.empty_end;
-        log::debug!("subsonic {endpoint}: from {} ({}), {} bytes{}", head.start, if head.range_honoured { "as asked" } else { "range ignored" }, d.received, if stopped { ", stopped" } else { "" });
-        Ok(Streamed { head, received: d.received, stopped })
+        let req = Request { method: "GET", url: &url, headers: &[], body: &[], user_agent: &self.user_agent, timeout_ms: self.stream_timeout_ms };
+        let streamed = audio::download(&req, range_start, if_range, sink).map_err(|e| {
+            let e = match e {
+                StreamError::Network(e) => Error::Network(e.to_string()),
+                StreamError::BadRange => Error::BadResponse("invalid Content-Range".into()),
+                StreamError::Response { status, content_type, body } => self.binary_error(status, content_type.as_deref(), &body)
+                    .unwrap_or_else(|| Error::BadResponse("an error answer without an error".into())),
+            };
+            self.failed(endpoint, e)
+        })?;
+        log::debug!("subsonic {endpoint}: from {} ({}), {} bytes{}", streamed.head.start, if streamed.head.range_honoured { "as asked" } else { "range ignored" }, streamed.received, if streamed.stopped { ", stopped" } else { "" });
+        Ok(streamed)
     }
 
     // ---- writes (refused when read-only) ---------------------------------------------
@@ -682,38 +576,6 @@ fn star_params(song_ids: &[&str], album_ids: &[&str], artist_ids: &[&str]) -> Pa
     [ids("id", song_ids), ids("albumId", album_ids), ids("artistId", artist_ids)].concat()
 }
 
-/// Build a [`StreamHead`] from a 2xx audio response's HTTP head; fails with
-/// [`Error::BadResponse`] when a 206's `Content-Range` span overflows `u64`.
-fn stream_head(h: &Head, range_start: u64) -> Result<StreamHead, Error> {
-    let range = h.range().filter(|_| h.status == 206);
-    match range {
-        Some(r) => {
-            let range_len = r.last.checked_sub(r.first).and_then(|d| d.checked_add(1)).ok_or_else(|| Error::BadResponse("invalid Content-Range".into()))?;
-            Ok(StreamHead {
-                start: r.first,
-                range_honoured: r.first == range_start,
-                length: h.content_length.or(Some(range_len)),
-                total: r.total,
-                content_type: h.content_type.clone(),
-                validator: h.validator().map(str::to_owned),
-            })
-        }
-        None => Ok(StreamHead {
-            start: 0,
-            range_honoured: range_start == 0,
-            length: h.content_length,
-            total: h.content_length,
-            content_type: h.content_type.clone(),
-            validator: h.validator().map(str::to_owned),
-        }),
-    }
-}
-
-/// The total of an unsatisfied `Content-Range` ("bytes */1000").
-fn total_of_unsatisfied(content_range: &str) -> Option<u64> {
-    content_range.trim().strip_prefix("bytes")?.trim().strip_prefix("*/")?.trim().parse().ok()
-}
-
 /// The `subsonic-response` of an answer, when it is a successful one; else the error, sorted.
 /// The body's text is never put in a message (a proxy's page could echo the URL).
 fn envelope(status: u16, body: &[u8]) -> Result<Value, Error> {
@@ -760,48 +622,6 @@ mod tests {
         assert_eq!(envelope(200, br#"{"hello":1}"#), Err(Error::NotSubsonic("JSON of another kind".into())));
         assert_eq!(envelope(200, b"\x00\x01garbage"), Err(Error::NotSubsonic("an answer that is not JSON".into())));
         assert_eq!(envelope(502, b"Bad gateway"), Err(Error::Server { code: None, http_status: Some(502), message: String::new() }));
-    }
-
-    #[test]
-    fn unsatisfied_ranges_read() {
-        assert_eq!(total_of_unsatisfied("bytes */1000"), Some(1000));
-        assert_eq!(total_of_unsatisfied("bytes 0-1/2"), None);
-    }
-
-    #[test]
-    fn overflowing_content_range_is_rejected() {
-        let hostile = Head {
-            status: 206,
-            content_length: None,
-            content_range: Some("bytes 0-18446744073709551615/*".into()),
-            content_type: Some("audio/flac".into()),
-            ..Head::default()
-        };
-        assert!(matches!(stream_head(&hostile, 0), Err(Error::BadResponse(_))));
-        let hostile_with_len = Head { content_length: Some(5), ..hostile };
-        assert!(matches!(stream_head(&hostile_with_len, 0), Err(Error::BadResponse(_))));
-
-        // Boundary range that does not overflow: 1..=u64::MAX has length u64::MAX.
-        let max_valid = Head {
-            status: 206,
-            content_length: None,
-            content_range: Some("bytes 1-18446744073709551615/*".into()),
-            content_type: Some("audio/flac".into()),
-            ..Head::default()
-        };
-        let sh = stream_head(&max_valid, 1).unwrap();
-        assert_eq!((sh.start, sh.range_honoured, sh.length, sh.total), (1, true, Some(u64::MAX), None));
-
-        // Normal range without Content-Length derives length from Content-Range.
-        let normal = Head {
-            status: 206,
-            content_length: None,
-            content_range: Some("bytes 10-19/100".into()),
-            content_type: Some("audio/flac".into()),
-            ..Head::default()
-        };
-        let sh = stream_head(&normal, 10).unwrap();
-        assert_eq!((sh.start, sh.range_honoured, sh.length, sh.total), (10, true, Some(10), Some(100)));
     }
 
     #[test]

@@ -19,6 +19,19 @@ use player_core::{Event, Player};
 use super::*;
 use crate::server::streammock::{self, FORMATS, Mock};
 
+#[test]
+fn stepping_quality_reaches_each_preset_and_stops_at_the_ends() {
+    let mut quality = None;
+    for kbps in [320, 192, 128, 96, 96] {
+        quality = quality_step(quality, -1);
+        assert_eq!(quality, Some(kbps));
+    }
+    assert_eq!(quality_step(Some(96), 1), Some(128));
+    assert_eq!(quality_step(Some(320), 1), None);
+    assert_eq!(quality_step(None, 1), None);
+    assert_eq!(quality_step(Some(123), 0), None);
+}
+
 /// A device that takes audio at about ten times real time and keeps nothing.
 #[derive(Clone, Default)]
 struct Null {
@@ -73,7 +86,11 @@ fn fixtures(seconds: u32) -> Option<Vec<PathBuf>> {
 }
 
 fn info(id: &str, bytes: &[u8], suffix: &str) -> StreamInfo {
-    StreamInfo { song_id: id.to_owned(), suffix: Some(suffix.to_owned()), content_type: None, size: bytes.len() as i64 }
+    StreamInfo { song_id: id.to_owned(), suffix: Some(suffix.to_owned()), content_type: None, size: bytes.len() as i64, ..Default::default() }
+}
+
+fn data_path(dir: &Path, info: &StreamInfo) -> PathBuf {
+    CachedFile::new(dir, info, None).path
 }
 
 /// A streamer on a fresh folder, signed in to the mock, quick to notice a stall.
@@ -134,7 +151,7 @@ fn stretches_and_gaps() {
 
 #[test]
 fn keys_name_the_song_and_its_size() {
-    let i = StreamInfo { song_id: "3f2a9cDe_x-1".into(), suffix: Some("FLAC".into()), content_type: None, size: 1234 };
+    let i = StreamInfo { song_id: "3f2a9cDe_x-1".into(), suffix: Some("FLAC".into()), content_type: None, size: 1234, ..Default::default() };
     assert_eq!(key(&i), "3f2a9cDe_x-1-1234");
     assert_eq!(extension(&i), "flac");
     // A changed file under the same id is another file.
@@ -464,7 +481,7 @@ fn eviction_keeps_the_cap_and_the_tracks_kept() {
     cfg.changed = Some(Arc::new(move |_| *c.lock().unwrap() += 1));
     let s = Streamer::new(cfg);
     // Five whole files of 3,000 bytes, played in order 0..5 (0 the longest ago).
-    let infos: Vec<StreamInfo> = (0..5).map(|n| StreamInfo { song_id: format!("e{n}"), suffix: Some("flac".into()), content_type: None, size: 3000 }).collect();
+    let infos: Vec<StreamInfo> = (0..5).map(|n| StreamInfo { song_id: format!("e{n}"), suffix: Some("flac".into()), content_type: None, size: 3000, ..Default::default() }).collect();
     let base = SystemTime::now() - Duration::from_secs(3600);
     for (n, i) in infos.iter().enumerate() {
         let p = data_path(&d, i);
@@ -572,7 +589,7 @@ fn a_clear_waiting_on_a_stalled_download_leaves_the_next_session_alone() {
     assert!(!done.load(Ordering::SeqCst), "the clear was still waiting (the test proves nothing otherwise)");
     clearing.join().unwrap();
 
-    assert!(whole(s.dir(), &ib).is_some(), "the new session's track stays");
+    assert!(CachedFile::new(s.dir(), &ib, None).whole(), "the new session's track stays");
     assert_eq!(fs::read(data_path(s.dir(), &ib)).unwrap(), new);
     assert!(!pa.exists() && !sidecar_path(s.dir(), &key(&ia)).exists(), "the old session's files went");
     assert!(s.shutdown_and_wait(Duration::from_secs(5)));
@@ -749,9 +766,8 @@ fn a_request_after_a_failure_is_not_given_the_failed_feed() {
     let s = streamer(&mock, "failed-not-ended");
     let k = key(&i);
     let failing = Arc::new(Download {
-        key: k.clone(),
+        file: CachedFile::new(s.dir(), &i, None),
         info: i.clone(),
-        path: data_path(s.dir(), &i),
         feed: Feed::new(),
         stop: Mutex::new(None),
         woken: Condvar::new(),
@@ -766,5 +782,129 @@ fn a_request_after_a_failure_is_not_given_the_failed_feed() {
     failing.ended.store(true, Ordering::Release);
     wait_until(Duration::from_secs(10), "whole", || feed.is_complete());
     assert_eq!(fs::read(data_path(s.dir(), &i)).unwrap(), bytes);
+    assert!(s.shutdown_and_wait(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_cap_keeps_mp3_bitrates_separate_and_reuses_a_complete_original() {
+    let mock = Mock::start();
+    let original = vec![3; 100_000];
+    let i = info("capped", &original, "flac");
+    let s = streamer(&mock, "capped-cache");
+    mock.add("capped", original.clone(), "audio/flac");
+    for (kbps, bytes) in [(96, vec![1; 10_000]), (192, vec![2; 23_000])] {
+        mock.add_mp3("capped", kbps, bytes.clone());
+        s.set_quality(Some(kbps));
+        let req = s.request(1, &i).unwrap();
+        let feed = feed_of(&req);
+        wait_until(Duration::from_secs(5), "encoded stream finished", || feed.is_complete());
+        assert_eq!(req.path.file_name().unwrap().to_str().unwrap(), format!("capped-100000-mp3-{kbps}k.mp3"));
+        assert_eq!(fs::read(req.path).unwrap(), bytes);
+    }
+
+    s.set_quality(Some(96));
+    let cached = s.request(1, &i).unwrap();
+    assert!(cached.feed.is_none());
+    assert_eq!(mock.streams().len(), 2);
+    s.set_quality(None);
+    let raw = s.request(1, &i).unwrap();
+    let feed = feed_of(&raw);
+    wait_until(Duration::from_secs(5), "original downloaded", || feed.is_complete() && !s.lock().downloads.contains_key(&key(&i)));
+    assert_eq!(raw.path, s.dir().join("capped-100000.flac"));
+    assert_eq!(fs::read(&raw.path).unwrap(), original);
+    s.set_quality(Some(128));
+    let reuse = s.request(1, &i).unwrap();
+    assert_eq!(reuse.path, raw.path);
+    assert!(reuse.feed.is_none());
+    assert_eq!(mock.streams().len(), 3);
+
+    let mut low = info("low", &original, "opus");
+    low.bitrate_kbps = Some(96);
+    mock.add("low", original, "audio/ogg");
+    let direct = s.request(1, &low).unwrap();
+    assert_eq!(direct.path.extension().unwrap(), "opus");
+    let feed = feed_of(&direct);
+    wait_until(Duration::from_secs(5), "low bitrate original downloaded", || feed.is_complete());
+    assert!(s.shutdown_and_wait(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_partial_transcode_restarts_at_zero_and_never_splices_encoder_runs() {
+    let mock = Mock::start();
+    let s = streamer(&mock, "partial-transcode");
+    let i = info("live", &[0; 25], "flac");
+    let file = CachedFile::new(s.dir(), &i, Some(96));
+    let sidecar = sidecar_path(s.dir(), &file.key);
+    // A previous run left a sparse file, including bytes beyond the end of the next encoding.
+    fs::write(&file.path, vec![7; 190_000]).unwrap();
+    write_sidecar(&sidecar, 190_000, &[0..10_000, 180_000..190_000], None).unwrap();
+
+    s.set_quality(Some(96));
+    mock.add_mp3("live", 96, vec![2; 160_000]);
+    mock.set(|b| b.drop_at = Some(32_000));
+    let feed = feed_of(&s.request(1, &i).unwrap());
+    wait_until(Duration::from_secs(5), "truncated response failed", || feed.failure().is_some());
+    assert!(sidecar.exists() && !file.whole());
+    assert_eq!(fs::read(&file.path).unwrap(), vec![2; 32_000]);
+
+    let fresh = vec![4; 20_000];
+    mock.add_mp3("live", 96, fresh.clone());
+    let feed = feed_of(&s.request(2, &i).unwrap());
+    wait_until(Duration::from_secs(5), "fresh encoding finished", || feed.is_complete());
+    assert!(file.whole());
+    assert_eq!(fs::read(&file.path).unwrap(), fresh);
+    let requests = mock.streams();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| r.from == 0 && r.if_range.is_none()));
+    assert!(s.shutdown_and_wait(Duration::from_secs(5)));
+}
+
+#[test]
+fn changing_quality_keeps_the_playing_file_and_prepared_next_and_applies_to_prefetch() {
+    let mock = Mock::start();
+    let s = streamer(&mock, "quality-and-queue");
+    let raw = vec![1; 120_000];
+    let now = info("now", &raw, "flac");
+    let next = info("next", &raw, "flac");
+    let ahead = info("ahead", &raw, "flac");
+    for i in [&now, &next] {
+        mock.add(&i.song_id, raw.clone(), "audio/flac");
+    }
+    mock.add_mp3("ahead", 96, vec![6; 13_000]);
+    mock.set(|b| b.rate = 45_000);
+    let playing = s.request(1, &now).unwrap();
+    let prepared = s.request(2, &next).unwrap();
+    let pair = [now.clone(), next.clone()];
+    s.keep(&pair, Some(ahead.clone()));
+    s.set_quality(Some(96));
+    s.keep(&pair, Some(ahead.clone()));
+    mock.set(|b| b.rate = 0);
+    wait_until(Duration::from_secs(5), "originals finish", || feed_of(&playing).is_complete() && feed_of(&prepared).is_complete());
+    let prefetched = CachedFile::new(s.dir(), &ahead, Some(96));
+    wait_until(Duration::from_secs(5), "next MP3 prefetched", || prefetched.whole());
+    assert_eq!(mock.streams().len(), 3);
+    s.clear(false);
+    assert!(playing.path.exists() && prepared.path.exists() && prefetched.whole());
+    assert_eq!(s.request(3, &ahead).unwrap().path, prefetched.path);
+    assert!(s.shutdown_and_wait(Duration::from_secs(5)));
+}
+
+#[test]
+fn a_chunked_mp3_transcode_can_play_before_the_encoding_finishes() {
+    let Some(files) = fixtures(20) else { return };
+    let mp3 = fs::read(&files[1]).unwrap();
+    let mock = Mock::start();
+    let s = streamer(&mock, "play-live-mp3");
+    mock.add_mp3("lossless", 192, mp3.clone());
+    mock.set(|b| b.rate = mp3.len() as u64 / 4);
+    s.set_quality(Some(192));
+    let req = s.request(1, &info("lossless", &[0; 5], "flac")).unwrap();
+    let feed = feed_of(&req);
+    let (p, rx) = player();
+    p.play(req);
+    until(&rx, Duration::from_secs(6), "audible MP3", |e| matches!(e, Event::TrackStarted { token: 1 }));
+    assert!(!feed.is_complete(), "first sound before the HTTP stream ends");
+    wait_until(Duration::from_secs(10), "MP3 cached", || feed.is_complete());
+    assert_eq!(mock.streams().len(), 1);
     assert!(s.shutdown_and_wait(Duration::from_secs(5)));
 }

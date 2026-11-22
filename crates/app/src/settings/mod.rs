@@ -373,9 +373,15 @@ pub struct Settings {
     /// Settings > Playback > Music from the server: the most the stream cache keeps, in MB
     /// (`server/streaming.rs`; least recently played files go first).
     pub stream_cache_mb: u64,
+    /// Target bitrate for new server streams. An absent value plays the original file.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stream_bitrate_kbps: Option<u32>,
     /// Settings > Library > Server: favourites of the server's tracks kept in step
     /// with the server, both ways (`server/write.rs`). On unless turned off.
     pub server_marks: bool,
+    /// Identifies this installation to Plex across browser sign-ins, including after sign-out.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub plex_client_id: String,
     /// Plays of the server's tracks reported to it (`scrobble`). On unless turned off.
     pub server_plays: bool,
     /// The app's own scrobbles and "now playing", to Last.fm and to ListenBrainz, of tracks
@@ -465,7 +471,9 @@ impl Default for Settings {
             crossfade: CrossfadeSettings::default(),
             discord: DiscordSettings::default(),
             stream_cache_mb: crate::server::streaming::DEFAULT_CAP_MB,
+            stream_bitrate_kbps: None,
             server_marks: true,
+            plex_client_id: String::new(),
             server_plays: true,
             server_lastfm: true,
             listenbrainz_love: false,
@@ -712,6 +720,7 @@ mod tests {
         assert!(!s.equalizer.all.enabled && s.equalizer.all.preamp_auto && s.equalizer.all.bands.len() == 10, "the equalizer is off, flat");
         assert!(!s.crossfade.enabled && s.crossfade.album_gapless, "no crossfade; albums gapless when it is on");
         assert_eq!(s.stream_cache_mb, 2048, "the stream cache keeps 2 GB");
+        assert_eq!(s.stream_bitrate_kbps, None, "existing settings keep original-quality playback");
         let s: Settings = serde_json::from_str(r#"{ "albums_sort": "most_played", "albums_desc": true, "close_action": "quit" }"#).unwrap();
         assert_eq!((s.albums_sort, s.albums_desc, s.close_action), (AlbumSort::MostPlayed, true, CloseAction::Quit));
     }

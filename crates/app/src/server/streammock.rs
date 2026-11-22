@@ -71,6 +71,7 @@ fn modified(n: usize) -> String {
 #[derive(Default)]
 struct Shared {
     songs: Mutex<HashMap<String, Song>>,
+    mp3s: Mutex<HashMap<(String, u32), Song>>,
     lyrics: Mutex<HashMap<String, String>>,
     behaviour: Mutex<Behaviour>,
     seen: Mutex<Vec<Seen>>,
@@ -129,6 +130,11 @@ impl Mock {
         self.shared.songs.lock().unwrap().insert(id.to_owned(), Song { bytes: Arc::new(bytes), content_type: content_type.to_owned(), modified: modified(0) });
     }
 
+    #[cfg(test)]
+    pub fn add_mp3(&self, id: &str, bitrate: u32, bytes: Vec<u8>) {
+        self.shared.mp3s.lock().unwrap().insert((id.to_owned(), bitrate), Song { bytes: Arc::new(bytes), content_type: "audio/mpeg".to_owned(), modified: String::new() });
+    }
+
     /// The song's file replaced on the server by `bytes`, under the same id: another
     /// `Last-Modified` from here on.
     pub fn replace(&self, id: &str, bytes: Vec<u8>) {
@@ -180,8 +186,8 @@ impl Mock {
     }
 
     /// A read-only client for it, as the app makes one.
-    pub fn client(&self) -> subsonic::Client {
-        subsonic::Client::new(self.credentials(), true).expect("client")
+    pub fn client(&self) -> super::provider::Client {
+        super::provider::Client::Subsonic(subsonic::Client::new(self.credentials(), true).expect("client"))
     }
 }
 
@@ -277,7 +283,14 @@ fn answer(mut conn: TcpStream, s: &Shared, n: usize) {
             let l = s.lyrics.lock().unwrap().get(&id).cloned().unwrap_or_else(|| "[]".into());
             reply(&mut conn, 200, "application/json", format!(r#"{{"subsonic-response":{{{ENVELOPE},"lyricsList":{{"structuredLyrics":{l}}}}}}}"#).as_bytes())
         }
-        "stream" => stream(&mut conn, s, &id, from, if_range.as_deref(), param("format").as_deref() == Some("raw"), n),
+        "stream" => {
+            let bitrate = match param("format").as_deref() {
+                Some("raw") => None,
+                Some("mp3") => Some(param("maxBitRate").unwrap().parse().unwrap()),
+                _ => return reply(&mut conn, 400, "text/plain", b"unsupported format"),
+            };
+            stream(&mut conn, s, &id, from, if_range.as_deref(), bitrate, n)
+        }
         _ => reply(&mut conn, 200, "application/json", br#"{"subsonic-response":{"status":"failed","version":"1.16.1","error":{"code":0,"message":"not in the mock"}}}"#),
     }
 }
@@ -297,9 +310,11 @@ fn client_left(conn: &TcpStream) -> bool {
     left
 }
 
-fn stream(conn: &mut TcpStream, s: &Shared, id: &str, from: u64, if_range: Option<&str>, raw: bool, n: usize) {
-    assert!(raw, "the app asks for the original file only");
-    let song = s.songs.lock().unwrap().get(id).cloned();
+fn stream(conn: &mut TcpStream, s: &Shared, id: &str, from: u64, if_range: Option<&str>, bitrate: Option<u32>, n: usize) {
+    let song = match bitrate {
+        Some(kbps) => s.mp3s.lock().unwrap().get(&(id.to_owned(), kbps)).cloned(),
+        None => s.songs.lock().unwrap().get(id).cloned(),
+    };
     let Some(song) = song else {
         return reply(conn, 404, "text/plain", b"404 page not found");
     };
@@ -315,13 +330,15 @@ fn stream(conn: &mut TcpStream, s: &Shared, id: &str, from: u64, if_range: Optio
     let len = song.bytes.len() as u64;
     // A range of another version of the file than the one asked about: the whole file instead.
     let changed = if_range.is_some_and(|v| v != song.modified);
-    let start = if b.ignore_ranges || changed { 0 } else { from };
+    let start = if bitrate.is_some() || b.ignore_ranges || changed { 0 } else { from };
     let lm = format!("Last-Modified: {}", song.modified);
     if start >= len && len > 0 {
         let _ = write_head(conn, 416, "text/plain", &[format!("Content-Range: bytes */{len}")], 0);
         return;
     }
-    let ok = if start > 0 {
+    let ok = if bitrate.is_some() {
+        conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: audio/mpeg\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").is_ok()
+    } else if start > 0 {
         write_head(conn, 206, &song.content_type, &[format!("Content-Range: bytes {start}-{}/{len}", len - 1), "Accept-Ranges: bytes".into(), lm], (len - start) as usize)
     } else {
         write_head(conn, 200, &song.content_type, &["Accept-Ranges: bytes".into(), lm], len as usize)
@@ -387,7 +404,10 @@ fn stream(conn: &mut TcpStream, s: &Shared, id: &str, from: u64, if_range: Optio
             due = Instant::now();
         }
         s.doing.lock().unwrap().insert(n, format!("stream {id} from {from}: writing at {at}"));
-        if conn.write_all(&song.bytes[at as usize..end as usize]).is_err() {
+        if bitrate.is_some() && write!(conn, "{:x}\r\n", end - at).is_err() {
+            return;
+        }
+        if conn.write_all(&song.bytes[at as usize..end as usize]).is_err() || (bitrate.is_some() && conn.write_all(b"\r\n").is_err()) {
             return;
         }
         s.sent.fetch_add((end - at) as usize, Ordering::SeqCst);
@@ -403,6 +423,9 @@ fn stream(conn: &mut TcpStream, s: &Shared, id: &str, from: u64, if_range: Optio
             due = Instant::now();
         }
         at = end;
+    }
+    if bitrate.is_some() {
+        let _ = conn.write_all(b"0\r\n\r\n");
     }
     let _ = conn.flush();
 }
