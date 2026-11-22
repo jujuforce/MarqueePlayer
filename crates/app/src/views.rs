@@ -10,6 +10,7 @@ use slint::{ComponentHandle, Model, ModelRc, VecModel};
 use crate::covers::{self, AlbumModel, Kind};
 use crate::settings::{self, ShelfLayout};
 use crate::nav::Route;
+use crate::server::sync::CoverUpdate;
 use crate::state::State;
 use crate::{AlbumPage, ArtistPage, Backdrop, Browse, Grid, Home, Library, Nav, Page, Player, PlaylistRow, Playlists, Search, SettingHit, SettingsView, ShelfEdit, ShelfEditor, ShelfPage, ShelfView, Theme, TrackPage};
 
@@ -314,6 +315,9 @@ fn show(st: &Rc<State>, route: &Route, scroll: f32) -> bool {
 /// The open album's art on its page; otherwise the playing album's.
 pub fn update_backdrop(st: &Rc<State>) {
     let Some(app) = st.app.upgrade() else { return };
+    thread_local! { static REQUEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+    let request = REQUEST.get().wrapping_add(1);
+    REQUEST.set(request);
     let page = app.global::<Nav>().get_page();
     let stem = if page == Page::Album {
         st.open_album.get().and_then(|id| query::album(&st.db, id).ok().flatten()).and_then(|a| a.art)
@@ -323,7 +327,7 @@ pub fn update_backdrop(st: &Rc<State>) {
     let weak = st.app.clone();
     match stem {
         Some(stem) => covers::with_image(&stem, Kind::Blur, move |img| {
-            if let Some(app) = weak.upgrade() {
+            if REQUEST.get() == request && let Some(app) = weak.upgrade() {
                 let b = app.global::<Backdrop>();
                 b.set_image(img);
                 b.set_visible(true);
@@ -349,8 +353,6 @@ thread_local! {
     /// The album each hero shelf features (by the shelf's place in the settings), kept while
     /// the page is refreshed.
     static HERO_AT: std::cell::RefCell<std::collections::HashMap<usize, usize>> = std::cell::RefCell::new(std::collections::HashMap::new());
-    /// The art stems of each hero shelf's albums, for the blur behind the one featured.
-    static HERO_ART: std::cell::RefCell<std::collections::HashMap<usize, Vec<Option<String>>>> = std::cell::RefCell::new(std::collections::HashMap::new());
     /// The covers a row of Home's grid shelves holds, as the page last reported it (0: not yet).
     static GRID_COLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -445,8 +447,7 @@ fn shelf_view(st: &Rc<State>, index: usize, s: &crate::settings::ShelfConfig, al
     let hero = HERO_AT.with(|h| h.borrow().get(&index).copied().unwrap_or(0)).min(albums.len().saturating_sub(1));
     let mut stem = None;
     if s.layout == ShelfLayout::Hero {
-        stem = Some(albums.get(hero).and_then(|a| a.art.clone()));
-        HERO_ART.with(|a| a.borrow_mut().insert(index, albums.iter().map(|a| a.art.clone()).collect()));
+        stem = Some(albums.get(hero).and_then(crate::server::album_cover));
     }
     let m = AlbumModel::new(albums);
     let view = ShelfView {
@@ -482,7 +483,7 @@ pub fn refresh_home(st: &Rc<State>) {
     home.set_shelves(ModelRc::from(vm.clone()));
     *st.models.home.borrow_mut() = models;
     for (row, stem) in hero_stems {
-        hero_blur(&vm, row, stem);
+        hero_blur(&vm, row, &st.models.home.borrow()[row], stem);
     }
     HOME.with(|h| *h.borrow_mut() = Some(vm));
 }
@@ -528,7 +529,7 @@ fn refresh_home_live(st: &Rc<State>, grow: bool) {
             vm.insert(row, view);
             models.insert(row, m);
             if let Some(stem) = stem {
-                hero_blur(&vm, row, stem);
+                hero_blur(&vm, row, &models[row], stem);
             }
         }
         row += 1;
@@ -544,7 +545,7 @@ fn refresh_home_live(st: &Rc<State>, grow: bool) {
 
 /// The blurred art behind a hero shelf, for the album it features (none: the card's own
 /// colour).
-fn hero_blur(vm: &Rc<VecModel<ShelfView>>, row: usize, stem: Option<String>) {
+fn hero_blur(vm: &Rc<VecModel<ShelfView>>, row: usize, model: &Rc<AlbumModel>, stem: Option<String>) {
     let Some(stem) = stem else {
         if let Some(mut v) = vm.row_data(row) {
             v.hero_blur = Default::default();
@@ -553,12 +554,15 @@ fn hero_blur(vm: &Rc<VecModel<ShelfView>>, row: usize, stem: Option<String>) {
         return;
     };
     let vm = vm.clone();
+    let model = Rc::downgrade(model);
+    let expected = stem.clone();
     let Some(want) = vm.row_data(row).map(|v| (v.index, v.hero)) else { return };
     covers::with_image(&stem, Kind::Blur, move |img| {
         // By the shelf, not the row: rows may be put in above it meanwhile (Home during a scan).
         let Some(row) = (0..vm.row_count()).find(|&r| vm.row_data(r).is_some_and(|v| v.index == want.0)) else { return };
         if let Some(mut v) = vm.row_data(row)
             && v.hero == want.1
+            && model.upgrade().and_then(|m| m.art_at(v.hero as usize)).flatten().as_ref() == Some(&expected)
         {
             v.hero_blur = img;
             vm.set_row_data(row, v);
@@ -578,8 +582,11 @@ pub fn hero_select(index: usize, album: usize) {
         HERO_AT.with(|h| h.borrow_mut().insert(index, album));
         v.hero = album as i32;
         vm.set_row_data(row, v);
-        let art = HERO_ART.with(|a| a.borrow().get(&index).and_then(|v| v.get(album).cloned()).flatten());
-        hero_blur(&vm, row, art);
+        crate::state::with(|st| {
+            if let Some(m) = st.models.home.borrow().get(row) {
+                hero_blur(&vm, row, m, m.art_at(album).flatten());
+            }
+        });
     });
 }
 
@@ -800,9 +807,8 @@ fn group_albums(groups: Vec<Group>) -> Vec<Album> {
 }
 
 thread_local! {
-    /// The keys of the artist tiles shown (Artists, or a search's artists in full), by
-    /// place: a tile opens its artist exactly, also when two share a name.
-    static ARTIST_KEYS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// Keys and display names in tile order, including search results for track-only artists.
+    static ARTISTS_SHOWN: std::cell::RefCell<Vec<(String, String)>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Credits as links, by (kind, id, credit as shown): asked for by every row drawn.
     static LINKS: std::cell::RefCell<std::collections::HashMap<(bool, i32, String), Vec<crate::ArtistLink>>> = std::cell::RefCell::new(std::collections::HashMap::new());
 }
@@ -810,7 +816,7 @@ thread_local! {
 fn show_artists(st: &Rc<State>, title: &str, groups: Vec<Group>) {
     let Some(app) = st.app.upgrade() else { return };
     let n = groups.len();
-    ARTIST_KEYS.with(|k| *k.borrow_mut() = groups.iter().map(|g| g.key.clone()).collect());
+    remember_artists(&groups);
     st.models.artists.set(group_albums(groups));
     let b = app.global::<Browse>();
     b.set_artists_title(title.into());
@@ -821,6 +827,15 @@ fn show_artists(st: &Rc<State>, title: &str, groups: Vec<Group>) {
 fn fill_artists(st: &Rc<State>) {
     let groups = query::album_artists(&st.db).unwrap_or_default();
     show_artists(st, "Artists", groups);
+}
+
+fn remember_artists(groups: &[Group]) {
+    ARTISTS_SHOWN.with(|a| *a.borrow_mut() = groups.iter().map(|g| (g.key.clone(), g.name.clone())).collect());
+}
+
+fn search_artist_groups(st: &State, artists: impl Iterator<Item = (String, String)>) -> Vec<Group> {
+    let mut all: HashMap<_, _> = query::album_artists(&st.db).unwrap_or_default().into_iter().map(|g| (g.key.clone(), g)).collect();
+    artists.map(|(key, name)| all.remove(&key).unwrap_or(Group { name, key, albums: 0, art: None })).collect()
 }
 
 fn fill_groups(st: &Rc<State>, labels: bool) {
@@ -840,8 +855,13 @@ fn browse_live(st: &Rc<State>, page: Page) {
     let b = app.global::<Browse>();
     match page {
         Page::Artists => {
-            let groups = query::album_artists(&st.db).unwrap_or_default();
-            ARTIST_KEYS.with(|k| *k.borrow_mut() = groups.iter().map(|g| g.key.clone()).collect());
+            let groups = if matches!(st.history.borrow().current, Route::SearchAll { kind: SearchKind::Artists, .. }) {
+                ARTISTS_SHOWN.with(|a| search_artist_groups(st, a.borrow().iter().cloned()))
+            } else {
+                let groups = query::album_artists(&st.db).unwrap_or_default();
+                remember_artists(&groups);
+                groups
+            };
             b.set_artists_count(groups.len() as i32);
             st.models.artists.update(group_albums(groups));
         }
@@ -871,6 +891,60 @@ struct LiveRefresh {
 
 thread_local! {
     static LIVE: std::cell::RefCell<LiveRefresh> = std::cell::RefCell::default();
+    static GROUP_COVERS_DUE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Server art may arrive well after the catalog scan ends. Album cards observe each
+/// cover directly; the open album, hero backdrops and representative group covers also need it.
+pub(crate) fn server_covers_written(st: &Rc<State>, updates: &[CoverUpdate]) {
+    let Some(app) = st.app.upgrade() else { return };
+    match app.global::<Nav>().get_page() {
+        Page::Album => {
+            if let Some(id) = st.open_album.get()
+                && let Some(update) = updates.iter().find(|u| u.album_id == id)
+                && let Ok(Some(album)) = query::album(&st.db, id)
+                && album.remote_art.as_deref() == Some(&update.remote_art)
+                && album.art.as_deref() == Some(&update.stem)
+            {
+                load_album_cover(st, id, Some(&update.stem));
+                update_backdrop(st);
+            }
+        }
+        Page::Home => {
+            let Some(vm) = HOME.with(|h| h.borrow().clone()) else { return };
+            let mut heroes = HashSet::new();
+            for row in 0..vm.row_count() {
+                let Some(shelf) = vm.row_data(row).filter(|s| s.layout == crate::ShelfLayout::Hero) else { continue };
+                heroes.insert(shelf.index as usize);
+                if let Some(m) = st.models.home.borrow().get(row)
+                    && let Some(stem) = m.art_at(shelf.hero as usize).flatten()
+                    && updates.iter().any(|u| u.stem == stem)
+                {
+                    hero_blur(&vm, row, m, Some(stem));
+                }
+            }
+            // A random hero requires art. On first import its shelf can appear only after
+            // the first image was stored, even when all albums are already on screen.
+            if st.settings.borrow().shelves.iter().enumerate().any(|(i, s)| {
+                s.visible && s.query == ShelfQuery::Random && s.layout == ShelfLayout::Hero && !heroes.contains(&i)
+            }) {
+                refresh_home_live(st, true);
+            }
+        }
+        Page::Artists | Page::Genres | Page::Labels if !GROUP_COVERS_DUE.with(|due| due.replace(true)) => {
+            // Many albums can contribute to one group. Recompute the visible index once
+            // per interval, preserving search results and scroll position.
+            slint::Timer::single_shot(LIVE_EVERY, || {
+                GROUP_COVERS_DUE.with(|due| due.set(false));
+                crate::state::with(|st| {
+                    if let Some(app) = st.app.upgrade() {
+                        browse_live(st, app.global::<Nav>().get_page());
+                    }
+                });
+            });
+        }
+        _ => {}
+    }
 }
 
 /// A running scan wrote to the library (a batch of albums, or covers). The first albums of an
@@ -1091,13 +1165,7 @@ fn fill_search_all(st: &Rc<State>, kind: SearchKind, q: &str) -> Page {
         SearchKind::Artists => {
             // Album counts and covers from the artists' albums; an artist only on tracks
             // (a featured one) has neither.
-            let all: std::collections::HashMap<String, Group> =
-                query::album_artists(&st.db).unwrap_or_default().into_iter().map(|g| (g.key.clone(), g)).collect();
-            let groups = r
-                .artists
-                .into_iter()
-                .map(|a| all.get(&a.key).cloned().unwrap_or(Group { name: a.name, key: a.key, albums: 0, art: None }))
-                .collect();
+            let groups = search_artist_groups(st, r.artists.into_iter().map(|a| (a.key, a.name)));
             show_artists(st, &title, groups);
             Page::Artists
         }
@@ -1217,19 +1285,28 @@ fn fill_album(st: &Rc<State>, id: i64) -> bool {
     page.set_tracks(ModelRc::from(st.lists.album.clone()));
     page.set_favourite(query::is_favourite_album(&st.db, id).unwrap_or(false));
     page.set_full(Default::default());
-    if let Some(stem) = &album.art {
-        let weak = st.app.clone();
-        covers::with_image(stem, Kind::Full, move |img| {
-            if let Some(app) = weak.upgrade() {
-                let p = app.global::<AlbumPage>();
-                if p.get_album().id == id as i32 {
-                    p.set_full(img);
-                }
-            }
-        });
-    }
+    load_album_cover(st, id, crate::server::album_cover(&album).as_deref());
     st.open_album.set(Some(id));
     true
+}
+
+fn load_album_cover(st: &State, id: i64, stem: Option<&str>) {
+    thread_local! { static REQUEST: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+    let request = REQUEST.get().wrapping_add(1);
+    REQUEST.set(request);
+    let Some(stem) = stem else { return };
+    let weak = st.app.clone();
+    covers::with_image(stem, Kind::Full, move |img| {
+        if REQUEST.get() == request && let Some(app) = weak.upgrade() {
+            let p = app.global::<AlbumPage>();
+            let mut card = p.get_album();
+            if card.id == id as i32 {
+                card.has_cover = true;
+                p.set_album(card);
+                p.set_full(img);
+            }
+        }
+    });
 }
 
 // ---- artist ---------------------------------------------------------------------
@@ -1248,7 +1325,7 @@ pub fn open_artist(st: &Rc<State>, key_or_name: &str) {
 
 /// The artist tile at `index` of the artists shown.
 pub fn open_artist_at(st: &Rc<State>, index: usize) {
-    if let Some(key) = ARTIST_KEYS.with(|k| k.borrow().get(index).cloned()) {
+    if let Some(key) = ARTISTS_SHOWN.with(|a| a.borrow().get(index).map(|(key, _)| key.clone())) {
         open_artist(st, &key);
     }
 }
@@ -1536,7 +1613,6 @@ pub fn shelves_changed(st: &Rc<State>) {
 pub fn shelves_moved(st: &Rc<State>, to: impl Fn(usize) -> Option<usize>) {
     rekey(&mut st.shelf_seeds.borrow_mut(), &to);
     HERO_AT.with(|h| rekey(&mut h.borrow_mut(), &to));
-    HERO_ART.with(|a| rekey(&mut a.borrow_mut(), &to));
 }
 
 fn rekey<V>(m: &mut HashMap<usize, V>, to: impl Fn(usize) -> Option<usize>) {

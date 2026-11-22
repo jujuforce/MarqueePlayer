@@ -38,7 +38,7 @@ pub(crate) mod sync;
 pub(crate) mod write;
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -152,8 +152,9 @@ struct Ctl {
     facts: Facts,
     /// Where the catalog in the library came from (`host_of` its address), signed in or not.
     catalog_host: String,
-    /// Albums on screen whose cover was asked for this run.
-    asked: HashSet<i64>,
+    /// Remote artwork requested or received since this catalog was connected. A snapshot
+    /// taken before the download (such as a search result) can still resolve its cover.
+    covers: HashMap<String, Option<String>>,
 }
 
 thread_local! {
@@ -175,6 +176,7 @@ pub(crate) fn identity(c: &Credentials) -> String {
 /// it is joined (`crate::server::streaming::set_client`). The client is read-only; the writes' thread
 /// adds the kinds the switches allow to its own copy (`write::set_writes`).
 fn set_client(client: Option<Client>) {
+    with(|c| c.covers.clear());
     sync::covers_client(client.clone());
     crate::server::write::set_client(client.clone());
     crate::server::streaming::set_client(client);
@@ -182,7 +184,14 @@ fn set_client(client: Option<Client>) {
 
 pub fn install(st: &Rc<State>) {
     let art = st.art.clone();
-    sync::covers_start(st.paths.database(), art, |ids| state::post(move |st| covers_written(st, &ids)));
+    sync::covers_start(st.paths.database(), art, |generation, updates| {
+        state::post(move |st| {
+            if sync::covers_current(generation) {
+                publish_covers(&updates);
+                views::server_covers_written(st, &updates);
+            }
+        });
+    });
     crate::server::write::start(st.paths.database(), |changes| state::post(move |st| crate::server::write::apply(st, &changes)));
     crate::server::write::set_writes(crate::server::write::writes_of(&st.settings.borrow()));
     let loaded = navidrome::load(&navidrome::path(&st.paths.data));
@@ -445,6 +454,7 @@ fn finished(st: &Rc<State>, generation: u64, outcome: Outcome) {
     match outcome {
         Outcome::UpToDate(seen) => {
             crate::server::write::after_sync(seen);
+            sync::covers_kick();
             log::info!("server sync: up to date (no scan on the server since the last sync)");
             with(|c| c.problem = None);
             if reason.told() {
@@ -677,18 +687,29 @@ pub fn toggle(st: &Rc<State>, which: Switch) {
     show(st);
 }
 
-/// Covers came in for these albums (from the covers thread).
-fn covers_written(st: &Rc<State>, _ids: &[i64]) {
-    views::library_changed_live(st);
+fn publish_covers(updates: &[sync::CoverUpdate]) {
+    with(|c| {
+        for update in updates {
+            c.covers.insert(update.remote_art.clone(), Some(update.stem.clone()));
+        }
+    });
+    crate::covers::server_covers_written(updates);
 }
 
-/// An album on screen has no cover, and the server has one: fetch it first. Once a run per
-/// album (the covers thread knows whether it is still needed).
-pub fn want_cover(album: i64) {
-    let ask = with(|c| c.signed_in.is_some() && c.asked.insert(album));
-    if ask {
-        sync::covers_want(album);
-    }
+/// Resolve an album snapshot against artwork that arrived later. Prioritize an on-screen
+/// remote album once when its cover is still missing.
+pub fn album_cover(album: &library::Album) -> Option<String> {
+    let Some(key) = album.remote_art.as_ref().filter(|_| album.remote_only) else { return album.art.clone() };
+    with(|c| {
+        if let Some(stem) = c.covers.get(key) {
+            return stem.as_ref().or(album.art.as_ref()).cloned();
+        }
+        if album.art.is_none() && c.signed_in.is_some() {
+            c.covers.insert(key.clone(), None);
+            sync::covers_want(album.id);
+        }
+        album.art.clone()
+    })
 }
 
 // ---- words --------------------------------------------------------------------------------
@@ -916,6 +937,32 @@ pub fn diagnostics_line(st: &Rc<State>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_downloaded_cover_updates_visible_cards_and_older_catalog_snapshots() {
+        use crate::covers::{self, AlbumModel};
+        use library::{Album, ArtCache};
+        use slint::{Model, ModelExt};
+
+        let dir = std::env::temp_dir().join(format!("mp-cover-notifications-{}", std::process::id()));
+        covers::init(ArtCache::new(&dir));
+        let album = Album { id: 42, remote_only: true, remote_art: Some("front".into()), ..Album::default() };
+        let local = Album { id: 43, remote_only: false, ..album.clone() };
+        let model = AlbumModel::new(vec![album.clone(), local]);
+        // Slint re-evaluates this filter only when the model notifies it of a changed row.
+        let with_art = model.clone().filter(|card| card.has_cover);
+        assert_eq!(with_art.row_count(), 0);
+        let written = |key: &str| sync::CoverUpdate { album_id: album.id, remote_art: key.into(), stem: "a10b".into() };
+        publish_covers(&[written("previous")]);
+        assert_eq!(with_art.row_count(), 0);
+        publish_covers(&[written("front")]);
+        assert_eq!(with_art.row_count(), 1);
+        assert_eq!(with_art.row_data(0).unwrap().id, 42);
+        // A fresh search result or grid filter may have captured the album before it was written.
+        model.set(vec![album]);
+        assert_eq!(model.art_at(0).flatten().as_deref(), Some("a10b"));
+        let _ = std::fs::remove_dir(dir);
+    }
 
     #[test]
     fn errors_are_worded_by_their_class() {

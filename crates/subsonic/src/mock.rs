@@ -74,6 +74,8 @@ pub enum Trouble {
     WrongPassword,
     /// `getAlbum` of this album fails with a server error (code 0).
     FailAlbum(String),
+    /// The server fails to render one cover while the other images remain available.
+    FailCover(String),
     /// `getAlbumList2` ignores `offset`: every page is the first.
     IgnoreOffset,
 }
@@ -308,6 +310,9 @@ fn answer(mut conn: TcpStream, s: &Shared) {
         Trouble::WrongPassword => failed(40, "Wrong username or password"),
         _ if !auth_ok => failed(40, "Wrong username or password"),
         Trouble::FailAlbum(id) if endpoint == "getAlbum" && param("id") == Some(id.as_str()) => failed(0, "database is locked"),
+        Trouble::FailCover(id) if endpoint == "getCoverArt" && param("id") == Some(id.as_str()) => Reply {
+            status: 500, content_type: "text/plain", headers: Vec::new(), body: b"thumbnail unavailable".to_vec(),
+        },
         Trouble::IgnoreOffset if endpoint == "getAlbumList2" => {
             let first: Vec<(String, String)> = params.iter().filter(|(k, _)| k != "offset").cloned().collect();
             serve(&endpoint, &first, range, &mut s.library.lock().unwrap_or_else(|e| e.into_inner()))

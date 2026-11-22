@@ -62,6 +62,8 @@ const WORKERS: usize = 3;
 
 pub trait CoverListener {
     fn cover_ready(&self, stem: &str, kind: Kind);
+    /// Newly stored artwork can now be decoded by rows that showed a placeholder.
+    fn server_covers_written(&self, _updates: &[crate::server::sync::CoverUpdate]) {}
     /// The request for this cover was dropped (scrolled past): rows still on screen
     /// that want it should ask again.
     fn cover_dropped(&self, _stem: &str) {}
@@ -184,6 +186,16 @@ pub fn register(listener: Weak<dyn CoverListener>) {
     });
 }
 
+fn listeners() -> Vec<Rc<dyn CoverListener>> {
+    CACHE.with(|c| c.borrow().as_ref().map(|c| c.listeners.iter().filter_map(Weak::upgrade).collect()).unwrap_or_default())
+}
+
+pub fn server_covers_written(updates: &[crate::server::sync::CoverUpdate]) {
+    for listener in listeners() {
+        listener.server_covers_written(updates);
+    }
+}
+
 /// The image if it is in memory; otherwise `None` and a load is queued (or, if it is
 /// already queued, moved to the front: the newest request is served first).
 pub fn get(stem: &str, kind: Kind) -> Option<Image> {
@@ -254,10 +266,7 @@ fn request(stem: &str, kind: Kind, keep: bool) -> Option<Image> {
 }
 
 fn notify_dropped(stems: &[String]) {
-    let listeners = CACHE.with(|c| {
-        c.borrow().as_ref().map(|c| c.listeners.iter().filter_map(Weak::upgrade).collect::<Vec<_>>()).unwrap_or_default()
-    });
-    for l in listeners {
+    for l in listeners() {
         for stem in stems {
             l.cover_dropped(stem);
         }
@@ -465,12 +474,14 @@ pub struct AlbumModel {
     albums: RefCell<Vec<Album>>,
     /// Rows waiting for each cover stem.
     waiting: RefCell<HashMap<String, Vec<usize>>>,
+    /// Rows drawn from a remote catalog snapshot, by the server's artwork identifier.
+    remote_rows: RefCell<HashMap<String, HashSet<usize>>>,
     notify: RowNotify,
 }
 
 impl AlbumModel {
     pub fn new(albums: Vec<Album>) -> Rc<Self> {
-        let m = Rc::new(Self { albums: RefCell::new(albums), waiting: RefCell::default(), notify: RowNotify::default() });
+        let m = Rc::new(Self { albums: RefCell::new(albums), waiting: RefCell::default(), remote_rows: RefCell::default(), notify: RowNotify::default() });
         let weak: Weak<dyn CoverListener> = Rc::downgrade(&(m.clone() as Rc<dyn CoverListener>));
         register(weak);
         m
@@ -479,6 +490,7 @@ impl AlbumModel {
     pub fn set(&self, albums: Vec<Album>) {
         *self.albums.borrow_mut() = albums;
         self.waiting.borrow_mut().clear();
+        self.remote_rows.borrow_mut().clear();
         self.notify.reset();
     }
 
@@ -548,11 +560,11 @@ impl Model for AlbumModel {
         ROW_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let albums = self.albums.borrow();
         let a = albums.get(row)?;
-        // An album only the server has, on screen without its cover yet: fetched first.
-        if a.art.is_none() && a.remote_only && a.remote_art.is_some() {
-            crate::server::want_cover(a.id);
+        if let Some(key) = a.remote_art.as_ref().filter(|_| a.remote_only) {
+            self.remote_rows.borrow_mut().entry(key.clone()).or_default().insert(row);
         }
-        let cover = a.art.as_deref().and_then(|stem| {
+        let stem = crate::server::album_cover(a);
+        let cover = stem.as_deref().and_then(|stem| {
             let img = get(stem, card_kind());
             if img.is_none() {
                 // Once: a row read again while it waits is told once when the cover comes.
@@ -564,7 +576,9 @@ impl Model for AlbumModel {
             }
             img
         });
-        Some(card(a, cover))
+        let mut tile = card(a, cover);
+        tile.has_cover = stem.is_some();
+        Some(tile)
     }
 
     fn model_tracker(&self) -> &dyn ModelTracker {
@@ -573,6 +587,17 @@ impl Model for AlbumModel {
 }
 
 impl CoverListener for AlbumModel {
+    fn server_covers_written(&self, updates: &[crate::server::sync::CoverUpdate]) {
+        for update in updates {
+            let rows = self.remote_rows.borrow_mut().remove(&update.remote_art);
+            for row in rows.into_iter().flatten() {
+                if self.albums.borrow().get(row).is_some_and(|a| a.remote_only && a.remote_art.as_ref() == Some(&update.remote_art)) {
+                    self.notify.row_changed(row);
+                }
+            }
+        }
+    }
+
     fn cover_ready(&self, stem: &str, kind: Kind) {
         if kind != card_kind() {
             return;
@@ -676,9 +701,9 @@ pub fn cached_size(stem: &str, kind: Kind) -> Option<(u32, u32)> {
 }
 
 impl AlbumModel {
-    /// Measurement (bench/mod.rs): the art stem of a row, without asking for its cover.
+    /// The current art stem of a row, without decoding the image.
     pub fn art_at(&self, row: usize) -> Option<Option<String>> {
-        self.albums.borrow().get(row).map(|a| a.art.clone())
+        self.albums.borrow().get(row).map(crate::server::album_cover)
     }
 }
 

@@ -655,6 +655,14 @@ struct CoverWork {
     kicked: bool,
 }
 
+/// One thumbnail can fail on an otherwise healthy server. Remember these IDs
+/// across visible-row requests; a sync or reconnection starts a fresh attempt.
+#[derive(Default)]
+struct CoverRetry {
+    skipped: std::collections::HashSet<i64>,
+    paused: bool,
+}
+
 struct Covers {
     work: Mutex<CoverWork>,
     ready: Condvar,
@@ -670,9 +678,16 @@ pub fn cover_tag(cover: &str) -> String {
     format!("server:{}:{cover}", library::art::CACHE_VERSION)
 }
 
-/// Start the covers thread (once). `written` is told, from that thread, which albums have a
-/// cover now.
-pub fn covers_start(db: PathBuf, art: ArtCache, written: impl Fn(Vec<i64>) + Send + 'static) {
+/// The cover committed for an album. The server key ties a delayed notification to its artwork.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CoverUpdate {
+    pub album_id: i64,
+    pub remote_art: String,
+    pub stem: String,
+}
+
+/// Start the covers thread (once). The worker reports artwork after the database commit.
+pub(super) fn covers_start(db: PathBuf, art: ArtCache, written: impl Fn(u64, Vec<CoverUpdate>) + Send + 'static) {
     if COVERS.set(Covers { work: Mutex::default(), ready: Condvar::new() }).is_err() {
         return;
     }
@@ -681,13 +696,16 @@ pub fn covers_start(db: PathBuf, art: ArtCache, written: impl Fn(Vec<i64>) + Sen
         library::background_thread();
         let c = COVERS.get().expect("set above");
         let mut conn: Option<rusqlite::Connection> = None;
+        let mut retry = CoverRetry::default();
         loop {
             let (client, generation, wanted) = {
                 let mut w = c.work.lock().unwrap_or_else(|e| e.into_inner());
-                while w.client.is_none() || (!w.kicked && w.wanted.is_empty()) {
+                while w.client.is_none() || (!w.kicked && (w.wanted.is_empty() || retry.paused)) {
                     w = c.ready.wait(w).unwrap_or_else(|e| e.into_inner());
                 }
-                w.kicked = false;
+                if std::mem::take(&mut w.kicked) {
+                    retry = CoverRetry::default();
+                }
                 (w.client.clone().expect("checked"), w.generation, std::mem::take(&mut w.wanted))
             };
             if conn.is_none() {
@@ -700,7 +718,7 @@ pub fn covers_start(db: PathBuf, art: ArtCache, written: impl Fn(Vec<i64>) + Sen
                 }
             }
             let conn = conn.as_mut().expect("opened");
-            if let Err(e) = cover_pass(conn, &art, &client, generation, wanted, &written) {
+            if let Err(e) = cover_pass(conn, &art, &client, generation, wanted, &mut retry, &written) {
                 log::warn!("server covers: {e}");
             }
         }
@@ -719,6 +737,14 @@ pub fn covers_client(client: Option<Client>) {
     w.client = client;
     w.wanted.clear();
     c.ready.notify_all();
+}
+
+/// Whether a notification posted by the worker still belongs to the active connection.
+pub(super) fn covers_current(generation: u64) -> bool {
+    COVERS.get().is_some_and(|c| {
+        let w = c.work.lock().unwrap_or_else(|e| e.into_inner());
+        w.client.is_some() && w.generation == generation
+    })
 }
 
 /// Look for covers to fetch (after a sync).
@@ -753,7 +779,7 @@ fn next_batch(conn: &rusqlite::Connection, wanted: &mut Vec<i64>, skip: &std::co
     while out.len() < COVER_READERS
         && let Some(id) = wanted.pop()
     {
-        if !skip.contains(&id)
+        if !skip.contains(&id) && !out.iter().any(|(album, _)| *album == id)
             && let Some(c) = needs(conn, id)?
         {
             out.push((id, c));
@@ -781,8 +807,10 @@ enum Fetched {
     Stored(String),
     /// The server has none (or not an image): not asked again in this format.
     Missing,
-    /// Try again later (no connection, the server failing, the sign-in refused).
-    Later(Error),
+    /// The server could not serve this image. Other covers can still succeed.
+    Deferred,
+    /// Connectivity, authentication or another service-wide failure.
+    Pause(Error),
 }
 
 fn fetch(client: &Client, art: &ArtCache, cover: &str) -> Fetched {
@@ -794,14 +822,16 @@ fn fetch(client: &Client, art: &ArtCache, cover: &str) -> Fetched {
                 Fetched::Missing
             }
         },
-        Err(Error::NotFound(_) | Error::BadResponse(_) | Error::NotPermitted(_)) => Fetched::Missing,
-        Err(e) => Fetched::Later(e),
+        Err(Error::NotFound(_) | Error::BadResponse(_)) => Fetched::Missing,
+        // Subsonic can also report an item error in a successful HTTP response.
+        Err(Error::Server { http_status: Some(200 | 500) | None, .. }) => Fetched::Deferred,
+        Err(e) => Fetched::Pause(e),
     }
 }
 
-fn cover_pass(conn: &mut rusqlite::Connection, art: &ArtCache, client: &Client, generation: u64, mut wanted: Vec<i64>, written: &dyn Fn(Vec<i64>)) -> rusqlite::Result<()> {
+fn cover_pass(conn: &mut rusqlite::Connection, art: &ArtCache, client: &Client, generation: u64, mut wanted: Vec<i64>, retry: &mut CoverRetry, written: &dyn Fn(u64, Vec<CoverUpdate>)) -> rusqlite::Result<()> {
     let c = COVERS.get().expect("started");
-    let mut skip = std::collections::HashSet::new();
+    let mut failed_batches = 0;
     let mut fetched = 0;
     loop {
         {
@@ -811,44 +841,59 @@ fn cover_pass(conn: &mut rusqlite::Connection, art: &ArtCache, client: &Client, 
             }
             wanted.append(&mut w.wanted);
         }
-        let batch = next_batch(conn, &mut wanted, &skip)?;
+        let batch = next_batch(conn, &mut wanted, &retry.skipped)?;
         if batch.is_empty() {
             if fetched > 0 {
-                log::info!("server covers: {fetched} fetched");
+                log::info!("server covers: {fetched} fetched, {} deferred", retry.skipped.len());
             }
             return Ok(());
         }
         let results: Vec<Fetched> = std::thread::scope(|s| {
             let handles: Vec<_> = batch.iter().map(|(_, cover)| s.spawn(move || fetch(client, art, cover))).collect();
-            handles.into_iter().map(|h| h.join().unwrap_or(Fetched::Later(Error::BadResponse("panicked".into())))).collect()
+            handles.into_iter().map(|h| h.join().unwrap_or(Fetched::Pause(Error::BadResponse("panicked".into())))).collect()
         });
-        let mut later = None;
+        let mut pause = None;
+        let all_deferred = results.iter().all(|r| matches!(r, Fetched::Deferred));
         library::db::let_waiting_in();
         let tx = library::db::write(conn)?;
+        // The account can change while a slow cover request is in flight. Check again
+        // inside the transaction, before recording anything against the current catalog.
+        if c.work.lock().unwrap_or_else(|e| e.into_inner()).generation != generation {
+            return Ok(());
+        }
         let mut done = Vec::new();
-        for ((id, cover), r) in batch.iter().zip(results) {
+        for ((id, cover), r) in batch.into_iter().zip(results) {
             match r {
                 Fetched::Stored(stem) => {
-                    tx.execute("UPDATE albums SET art = ?2, art_checked = ?3 WHERE id = ?1 AND remote_art IS ?4", rusqlite::params![id, stem, cover_tag(cover), cover])?;
-                    done.push(*id);
-                    fetched += 1;
+                    let changed = tx.execute("UPDATE albums SET art = ?2, art_checked = ?3 WHERE id = ?1 AND remote_art IS ?4", rusqlite::params![id, stem, cover_tag(&cover), cover])?;
+                    if changed > 0 {
+                        done.push(CoverUpdate { album_id: id, remote_art: cover, stem });
+                        fetched += 1;
+                    }
                 }
                 Fetched::Missing => {
-                    tx.execute("UPDATE albums SET art_checked = ?2 WHERE id = ?1 AND remote_art IS ?3", rusqlite::params![id, cover_tag(cover), cover])?;
+                    tx.execute("UPDATE albums SET art_checked = ?2 WHERE id = ?1 AND remote_art IS ?3", rusqlite::params![id, cover_tag(&cover), cover])?;
                 }
-                Fetched::Later(e) => {
-                    skip.insert(*id);
-                    later = Some(e);
+                Fetched::Deferred => {
+                    retry.skipped.insert(id);
                 }
+                Fetched::Pause(e) => pause = Some(e),
             }
         }
         tx.commit()?;
         if !done.is_empty() {
-            written(done);
+            written(generation, done);
         }
-        if let Some(e) = later {
-            // The rest waits for the next sync, or an album on screen asking.
-            log::info!("server covers: stopped for now ({e})");
+        if let Some(e) = pause {
+            log::info!("server covers: paused until the next sync ({e})");
+            retry.paused = true;
+            return Ok(());
+        }
+        // Two consecutive batches with no working cover suggest the whole service is failing.
+        failed_batches = if all_deferred { failed_batches + 1 } else { 0 };
+        if failed_batches >= 2 {
+            log::info!("server covers: consecutive batches failed, paused until the next sync");
+            retry.paused = true;
             return Ok(());
         }
     }
@@ -1258,48 +1303,105 @@ mod tests {
         let f = Fixture::new("covers", lib);
         assert!(matches!(f.run(&f.job(true)).0, Outcome::Synced { .. }));
         let art = ArtCache::new(f.dir.join("art"));
-        let got: Arc<Mutex<Vec<i64>>> = Arc::default();
+        let got: Arc<Mutex<Vec<CoverUpdate>>> = Arc::default();
         let g = got.clone();
-        covers_start(f.dir.join("library.db"), art.clone(), move |ids| g.lock().unwrap().extend(ids));
-        covers_client(Some(f.job(false).client));
+        let generation = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let delivered = generation.clone();
+        covers_start(f.dir.join("library.db"), art.clone(), move |ticket, updates| {
+            delivered.store(ticket, Ordering::Relaxed);
+            g.lock().unwrap().extend(updates);
+        });
+        let client = f.job(false).client;
+        f.mock.set_trouble(Trouble::FailCover("al-al0005".into()));
+        covers_client(Some(client.clone()));
         let wait = |n: usize| {
             let t0 = std::time::Instant::now();
             while got.lock().unwrap().len() < n && t0.elapsed() < Duration::from_secs(20) {
                 std::thread::sleep(Duration::from_millis(20));
             }
-            // The last batch's write lands just after its albums are told.
-            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(got.lock().unwrap().len(), n, "committed cover notifications");
         };
-        wait(5);
-        let conn = f.conn();
-        let arts: Vec<(String, Option<String>, Option<String>)> = conn
-            .prepare("SELECT remote_art, art, art_checked FROM albums ORDER BY added_at DESC")
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .unwrap()
-            .map(Result::unwrap)
-            .collect();
-        assert_eq!(arts.iter().filter(|a| a.1.is_some()).count(), 5, "{arts:?}");
-        for (cover, stem, checked) in &arts {
-            assert_eq!(checked.as_deref(), Some(cover_tag(cover).as_str()), "recorded: {cover}");
-            if let Some(stem) = stem {
-                assert!(art.is_current(stem), "the cache's own sizes, backdrop and accent");
+        let wait_requests = |n| {
+            let start = std::time::Instant::now();
+            while f.mock.count("getCoverArt") < n && start.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(5));
             }
-        }
-        assert_eq!(f.mock.count("getCoverArt"), 6, "each once, the missing one too");
+            assert_eq!(f.mock.count("getCoverArt"), n);
+        };
+        // A 500 in the first batch leaves only that cover pending. The missing cover still
+        // gets checked, and the healthy covers from the second batch still reach the UI.
+        wait(4);
+        let conn = f.conn();
+        let (id, checked): (i64, Option<String>) = conn.query_row("SELECT id, art_checked FROM albums WHERE remote_id = 'al0005'", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert!(checked.is_none());
+        assert_eq!(f.mock.count("getCoverArt"), 6);
         let order: Vec<String> = f.mock.requests().into_iter().filter(|r| r.starts_with("getCoverArt")).collect();
         assert!(order[..3].iter().any(|r| r.ends_with("al-al0005")), "newest first: {order:?}");
         assert!(order[3..].iter().any(|r| r.ends_with("al-al0000")), "oldest last: {order:?}");
+        f.mock.set_trouble(Trouble::None);
+        covers_want(id);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(f.mock.count("getCoverArt"), 6, "scrolling does not retry a deferred cover");
+        covers_kick();
+        wait(5);
+        let arts: Vec<(i64, String, Option<String>, Option<String>)> = conn
+            .prepare("SELECT id, remote_art, art, art_checked FROM albums ORDER BY added_at DESC")
+            .unwrap()
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(arts.iter().filter(|a| a.2.is_some()).count(), 5, "{arts:?}");
+        for (id, cover, stem, checked) in &arts {
+            assert_eq!(checked.as_deref(), Some(cover_tag(cover).as_str()), "recorded: {cover}");
+            if let Some(stem) = stem {
+                assert!(art.is_current(stem), "the cache's own sizes, backdrop and accent");
+                assert!(got.lock().unwrap().contains(&CoverUpdate { album_id: *id, remote_art: cover.clone(), stem: stem.clone() }));
+            }
+        }
+        assert_eq!(f.mock.count("getCoverArt"), 7, "only the failed cover was retried");
         // Kicked again: nothing more is needed.
         covers_kick();
-        std::thread::sleep(Duration::from_millis(400));
-        assert_eq!(f.mock.count("getCoverArt"), 6);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(f.mock.count("getCoverArt"), 7);
         // A cache format of before: every server cover is fetched again.
         conn.execute("UPDATE albums SET art_checked = 'server:1:' || remote_art WHERE art IS NOT NULL", []).unwrap();
         got.lock().unwrap().clear();
         covers_kick();
         wait(5);
-        assert_eq!(f.mock.count("getCoverArt"), 11);
+        assert_eq!(f.mock.count("getCoverArt"), 12);
+        // The UI changes one album's cover while a batch is fetching. Hold the write lock until
+        // both requests arrive so the worker sees the old key, then the new value at its UPDATE.
+        let previous = generation.load(Ordering::Relaxed);
+        assert!(covers_current(previous));
+        covers_client(None);
+        assert!(!covers_current(previous));
+        conn.execute("UPDATE albums SET art_checked = NULL WHERE remote_id IN ('al0003', 'al0004')", []).unwrap();
+        let tx = library::db::write(&conn).unwrap();
+        tx.execute("UPDATE albums SET remote_art = NULL, art = NULL WHERE remote_id = 'al0004'", []).unwrap();
+        got.lock().unwrap().clear();
+        covers_client(Some(client.clone()));
+        wait_requests(14);
+        tx.commit().unwrap();
+        wait(1);
+        assert_eq!(got.lock().unwrap()[0].remote_art, "al-al0003");
+        assert!(!covers_current(previous));
+        assert!(covers_current(generation.load(Ordering::Relaxed)));
+        covers_client(None);
+        // A service-wide 503 stops the pass after one batch. Visible-row wakeups leave it
+        // paused; an ordinary sync after recovery resumes the queue.
+        conn.execute("UPDATE albums SET art_checked = NULL WHERE remote_art IS NOT NULL", []).unwrap();
+        f.mock.clear_requests();
+        got.lock().unwrap().clear();
+        f.mock.set_trouble(Trouble::Unavailable);
+        covers_client(Some(client));
+        wait_requests(COVER_READERS);
+        covers_want(id);
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(f.mock.count("getCoverArt"), COVER_READERS);
+        f.mock.set_trouble(Trouble::None);
+        covers_kick();
+        wait(4);
         covers_client(None);
     }
 }
