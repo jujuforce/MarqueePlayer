@@ -205,11 +205,31 @@ export component TrackList inherits Rectangle {
     in property <bool> details-column: true;
     private property <int> cursor;
     private property <int> at: min(root.cursor, root.tracks.length - 1);
-    // The cursor row's y less the page scroll (fixed while the page scrolls), for the menu.
-    private property <length> at-y;
+    // Short lists on other pages omit the viewport and show every row.
+    in property <length> viewport-height: -1px;
+    in property <length> viewport-top;
+    in property <[int]> heading-counts;
+    private property <length> row-height: 52px;
+    private property <length> heading-height: 44px;
+    pure function row-top(i: int) -> length {
+        return i * root.row-height + (root.heading-counts.length > i ? root.heading-counts[i] : 0) * root.heading-height;
+    }
+    // Move the visible window in small batches. Changes in pixel offset within a batch
+    // leave the live rows and their artist-link bindings alone.
+    private property <int> batch-size: 8;
+    private property <int> wanted-first: root.viewport-height >= 0px
+        ? floor(clamp(Actions.first-track-at(root.heading-counts, root.viewport-top - root.absolute-position.y,
+              root.row-height, root.heading-height) - 1, 0, root.tracks.length) / root.batch-size) * root.batch-size : 0;
+    private property <int> first;
+    init => { root.first = root.wanted-first; }
+    changed wanted-first => { root.first = root.wanted-first; }
+    private property <int> shown: root.viewport-height >= 0px
+        ? min(max(0, root.tracks.length - root.first), ceil(root.viewport-height / root.row-height) + root.batch-size + 2)
+        : root.tracks.length;
+    private property <length> at-y: root.absolute-position.y + root.row-top(root.at + 1) - root.row-height;
     // The list took the keyboard by a click: no ring until a key is used there.
     private property <bool> pointer-focus;
-    height: lay.preferred-height;
+    height: root.row-top(root.tracks.length);
     accessible-role: AccessibleRole.list;
     accessible-label: root.label;
     accessible-delegate-focus: root.at;
@@ -227,7 +247,7 @@ export component TrackList inherits Rectangle {
             if ListKeys.enter(ev) { Actions.play-in(root.ctx, root.at); return accept; }
             if ListKeys.menu-key(ev) {
                 Actions.menu-request-keys("track", root.ctx, root.at, root.tracks[root.at].id,
-                    self.absolute-position.x + 160px, root.at-y + Nav.page-scroll + 30px);
+                    self.absolute-position.x + 160px, root.at-y + 30px);
                 return accept;
             }
             if ListKeys.selection(ev, root.ctx) { return accept; }
@@ -237,6 +257,7 @@ export component TrackList inherits Rectangle {
                 Actions.select-cursor(root.ctx, root.at, n, ev.modifiers.shift);
                 root.cursor = n;
                 root.pointer-focus = false;
+                Actions.reveal(root.at-y, root.row-height);
                 return accept;
             }
             reject
@@ -244,48 +265,47 @@ export component TrackList inherits Rectangle {
         focus-gained => {
             Focus.zone = "";
             root.cursor = max(0, root.at);
+            if !root.pointer-focus { Actions.reveal(root.at-y, root.row-height); }
         }
-        lay := VerticalLayout {
+        for k in root.shown: slot := Rectangle {
+            private property <int> i: root.first + k;
+            private property <TrackRow> t: root.tracks[i];
             width: parent.width;
-            spacing: 0px;
-            for t[i] in root.tracks: VerticalLayout {
-                if t.disc-header != "": Text {
-                    height: 44px;
-                    vertical-alignment: bottom;
-                    text: t.disc-header;
-                    font-size: Theme.font-small;
-                    font-weight: 700;
-                    color: Theme.text-faint;
+            y: root.row-top(i);
+            height: root.row-top(i + 1) - self.y;
+            if slot.t.disc-header != "": Text {
+                y: 0px;
+                width: parent.width;
+                height: root.heading-height;
+                vertical-alignment: bottom;
+                text: slot.t.disc-header;
+                font-size: Theme.font-small;
+                font-weight: 700;
+                color: Theme.text-faint;
+            }
+            TrackListRow {
+                y: parent.height - self.height;
+                width: parent.width;
+                track: slot.t;
+                ctx: root.ctx;
+                index: slot.i;
+                show-cover: root.show-cover;
+                show-album: root.show-album;
+                details-column: root.details-column;
+                focused: fs.has-focus && slot.i == root.at && !root.pointer-focus;
+                select-press(ctrl, shift) => {
+                    root.cursor = slot.i;
+                    root.pointer-focus = true;
+                    fs.focus();
+                    Actions.select-press(root.ctx, slot.i, ctrl, shift);
                 }
-                TrackListRow {
-                    track: t;
-                    ctx: root.ctx;
-                    index: i;
-                    show-cover: root.show-cover;
-                    show-album: root.show-album;
-                    details-column: root.details-column;
-                    focused: fs.has-focus && i == root.at && !root.pointer-focus;
-                    changed focused => {
-                        if self.focused {
-                            root.at-y = self.absolute-position.y - Nav.page-scroll;
-                            Actions.reveal(self.absolute-position.y, self.height);
-                        }
-                    }
-                    select-press(ctrl, shift) => {
-                        root.cursor = i;
-                        root.at-y = self.absolute-position.y - Nav.page-scroll;
-                        root.pointer-focus = true;
-                        fs.focus();
-                        Actions.select-press(root.ctx, i, ctrl, shift);
-                    }
-                    select-release => { Actions.select-release(root.ctx, i); }
-                    play => { Actions.play-in(root.ctx, i); }
-                    enqueue(next) => { Actions.enqueue-in(root.ctx, i, next); }
-                    favourite => { Actions.favourite-in(root.ctx, i); }
-                    add-to-playlist(pid) => { Actions.add-to-playlist(root.ctx, i, pid); }
-                    open-album => { Actions.open-album(t.album-id); }
-                    open-artist => { Actions.open-artist(t.artist); }
-                }
+                select-release => { Actions.select-release(root.ctx, slot.i); }
+                play => { Actions.play-in(root.ctx, slot.i); }
+                enqueue(next) => { Actions.enqueue-in(root.ctx, slot.i, next); }
+                favourite => { Actions.favourite-in(root.ctx, slot.i); }
+                add-to-playlist(pid) => { Actions.add-to-playlist(root.ctx, slot.i, pid); }
+                open-album => { Actions.open-album(slot.t.album-id); }
+                open-artist => { Actions.open-artist(slot.t.artist); }
             }
         }
     }

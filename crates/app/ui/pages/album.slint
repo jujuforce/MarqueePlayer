@@ -15,7 +15,7 @@ export component AlbumPageView inherits Rectangle {
     // Room for every button? Otherwise "Play next" and "Add to queue" step aside: the "⋯"
     // menu has both (and Play, Shuffle, the heart and the menu stay).
     private property <bool> all-buttons: root.text-width >= 600px;
-    AutoFlickable {
+    flick := AutoFlickable {
         content-y <=> Nav.page-scroll;
         content-height: col.preferred-height;
         col := VerticalLayout {
@@ -90,7 +90,15 @@ export component AlbumPageView inherits Rectangle {
                 }
               }
             }
-            TrackList { tracks: AlbumPage.tracks; ctx: "album"; label: AlbumPage.album.title; details-column: AlbumPage.details-column; }
+            TrackList {
+                tracks: AlbumPage.tracks;
+                ctx: "album";
+                label: AlbumPage.album.title;
+                details-column: AlbumPage.details-column;
+                heading-counts: AlbumPage.heading-counts;
+                viewport-height: flick.height;
+                viewport-top: flick.absolute-position.y;
+            }
         }
     }
 }

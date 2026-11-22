@@ -295,6 +295,7 @@ export global TrackPage {
 }
 
 export global AlbumPage {
+    in-out property <[int]> heading-counts;
     in-out property <AlbumCard> album;
     in-out property <string> info;
     // The album's format ("FLAC · 16-bit / 44.1 kHz", "Mixed formats"), shown with the
@@ -959,6 +960,7 @@ export global Actions {
     // ("track" or "album", its id; 0 for a file from outside) where they stand in the
     // credit as shown, the rest plain text.
     pure callback artist-links(string, int, string) -> [ArtistLink];
+    pure callback first-track-at([int], length, length, length) -> int;
     // An artist tile of the Artists page (or a search's artists in full), by its place.
     callback open-artist-at(int);
     // A hero shelf (by its place in the settings) features its album at this index.
